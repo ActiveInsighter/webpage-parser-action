@@ -9,7 +9,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from parser import build_result, crawl_page, crawl_urls, extract, extract_x_posts, main, validate_options
+from webpage_parser.cli import main
+from webpage_parser.crawl import build_result, crawl_page, crawl_urls
+from webpage_parser.extract import extract
+from webpage_parser.options import validate_options
+from webpage_parser.x import extract_x_posts
 
 
 LEGACY_POST = '''<article data-testid="tweet"><div data-testid="User-Name">Alice @alice</div>
@@ -88,13 +92,13 @@ class ExtractionTests(unittest.TestCase):
             evidence = Path(folder) / "page.png"
             evidence.write_bytes(b"stale")
             os.environ["GITHUB_OUTPUT"] = str(Path(folder) / "outputs")
-            with patch("parser.crawl_urls", new=AsyncMock(return_value=pages)) as crawl:
+            with patch("webpage_parser.cli.crawl_urls", new=AsyncMock(return_value=pages)) as crawl:
                 status = main(["--url", "https://x.com/jack/status/20\nhttps://x.com/NASA", "--output", str(target)])
                 self.assertEqual(crawl.call_args.args[0], ["https://x.com/jack/status/20", "https://x.com/NASA"])
             self.assertEqual(status, 1)
             self.assertEqual(json.loads(target.read_text())["count"], 1)
             self.assertFalse(evidence.exists())
-            self.assertEqual(Path(os.environ["GITHUB_OUTPUT"]).read_text(), "count=1\n")
+            self.assertIn("count=1\n", Path(os.environ["GITHUB_OUTPUT"]).read_text())
 
     def test_bad_input_leaves_diagnostic_not_stale_success(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -107,14 +111,14 @@ class ExtractionTests(unittest.TestCase):
 class CrawlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_retry_only_transient_errors(self):
         crawler = SimpleNamespace(arun=AsyncMock(side_effect=[crawled(status=503), crawled()]))
-        with patch("parser.asyncio.sleep", new=AsyncMock()):
+        with patch("webpage_parser.crawl.asyncio.sleep", new=AsyncMock()):
             result = await crawl_page(crawler, "https://example.com", retries=1)
         self.assertTrue(result["success"])
         self.assertEqual(crawler.arun.await_count, 2)
 
     async def test_no_retries_for_login_wall(self):
         crawler = SimpleNamespace(arun=AsyncMock(return_value=crawled("Log in")))
-        result = await crawl_page(crawler, "https://x.com/NASA", retries=2)
+        result = await crawl_page(crawler, "https://x.com/NASA/status/456", retries=2)
         self.assertFalse(result["success"])
         self.assertEqual(crawler.arun.await_count, 1)
 

@@ -21,7 +21,7 @@ inputs:
     description: Retry count for transient network and HTTP errors (0 to 5)
     default: '2'
   mode:
-    description: auto detects X URLs; page extracts CSS; x extracts post cards
+    description: auto detects X URLs; page extracts CSS; x matches the requested status ID
     default: auto
   wait-for:
     description: Optional CSS selector to wait for before extracting
@@ -30,9 +30,45 @@ inputs:
     description: Seconds to allow dynamic content to render (0 to 30)
     default: '3'
   max-posts:
-    description: Maximum X posts per page (1 to 50)
-    default: '5'
+    description: Maximum cards with x-scope=visible (1 to 50); target always returns one
+    default: '1'
+  x-scope:
+    description: target matches the URL status ID; visible includes other public cards
+    default: target
+  transport:
+    description: auto tries anonymous HTTP then Chromium; http or browser forces a transport
+    default: auto
+  save-to:
+    description: none or pocketbase (failed writes fail the action)
+    default: none
+  content-type:
+    description: Editable content category, e.g. social_media
+    default: social_media
+  owner:
+    description: PocketBase aw_clients owner ID (required when saving)
+    default: ''
+  request-id:
+    description: Caller correlation ID, up to 128 characters
+    default: ''
+  options:
+    description: JSON overrides for x_scope, transport, save_to, content_type, owner, request_id
+    default: '{}'
+  pocketbase-url:
+    description: PocketBase HTTPS origin
+    default: ''
+  pocketbase-token:
+    description: PocketBase credential; pass from secrets, never from workflow inputs
+    default: ''
 outputs:
+  success:
+    description: Whether all crawls and requested database writes succeeded
+    value: ${{ steps.parse.outputs.success }}
+  record-ids:
+    description: JSON array of saved PocketBase record IDs
+    value: ${{ steps.parse.outputs.record-ids }}
+  request-id:
+    description: Caller correlation ID
+    value: ${{ steps.parse.outputs.request-id }}
   count:
     description: Number of extracted items
     value: ${{ steps.parse.outputs.count }}
@@ -58,6 +94,15 @@ runs:
         PARSER_WAIT_FOR: ${{ inputs.wait-for }}
         PARSER_DELAY: ${{ inputs.delay }}
         PARSER_MAX_POSTS: ${{ inputs.max-posts }}
+        PARSER_X_SCOPE: ${{ inputs.x-scope }}
+        PARSER_TRANSPORT: ${{ inputs.transport }}
+        PARSER_SAVE_TO: ${{ inputs.save-to }}
+        PARSER_CONTENT_TYPE: ${{ inputs.content-type }}
+        PARSER_OWNER: ${{ inputs.owner }}
+        PARSER_REQUEST_ID: ${{ inputs.request-id }}
+        PARSER_OPTIONS: ${{ inputs.options }}
+        POCKETBASE_URL: ${{ inputs.pocketbase-url }}
+        POCKETBASE_TOKEN: ${{ inputs.pocketbase-token }}
         CRAWL4AI_NO_CLOUD_NOTICE: '1'
       run: |
         set -euo pipefail
@@ -71,4 +116,8 @@ runs:
           --attribute "$PARSER_ATTRIBUTE" --timeout "$PARSER_TIMEOUT" \
           --retries "$PARSER_RETRIES" --mode "$PARSER_MODE" \
           --wait-for "$PARSER_WAIT_FOR" --delay "$PARSER_DELAY" \
-          --max-posts "$PARSER_MAX_POSTS"
+          --max-posts "$PARSER_MAX_POSTS" \
+          --x-scope "$PARSER_X_SCOPE" --transport "$PARSER_TRANSPORT" \
+          --save-to "$PARSER_SAVE_TO" --content-type "$PARSER_CONTENT_TYPE" \
+          --owner "$PARSER_OWNER" --request-id "$PARSER_REQUEST_ID" \
+          --options "$PARSER_OPTIONS"
