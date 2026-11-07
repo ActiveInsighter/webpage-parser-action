@@ -33,7 +33,8 @@ class PocketBaseStore:
         self.opener = build_opener(NoRedirect())
 
     def request(self, method, path, body=None):
-        headers = {'Authorization': self.token, 'Content-Type': 'application/json', 'Accept': 'application/json'}
+        headers = {'Authorization': self.token, 'Content-Type': 'application/json', 'Accept': 'application/json',
+                   'User-Agent': 'WebpageParserAction/2.0 (+https://github.com/ActiveInsighter/webpage-parser-action)'}
         request = Request(self.base + path, data=json.dumps(body, ensure_ascii=False).encode() if body is not None else None,
                           headers=headers, method=method)
         try:
