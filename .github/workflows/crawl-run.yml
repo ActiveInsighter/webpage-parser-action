@@ -1,0 +1,43 @@
+name: Crawl run
+# The scheduler (AnyWorkflow-workers) finds this run by its name: keep `webpage-crawl-<request id>`.
+run-name: webpage-crawl-${{ inputs.request_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: AnyWorkflow crawl run id (aw_crawl_runs). Its targets are read from PocketBase.
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check run id
+        env:
+          REQUEST_ID: ${{ inputs.request_id }}
+        run: '[[ "$REQUEST_ID" =~ ^[a-z0-9]{15}$ ]] || { echo "::error::request_id must be a 15-character record id"; exit 1; }'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --require-hashes -r requirements.txt
+      # Results go to PocketBase only. Nothing is uploaded: this repository's runs are public.
+      - name: Crawl, store and report
+        env:
+          REQUEST_ID: ${{ inputs.request_id }}
+          POCKETBASE_URL: ${{ vars.POCKETBASE_URL || 'https://pb.any1.tech' }}
+          POCKETBASE_TOKEN: ${{ secrets.WEBPAGE_POCKETBASE_TOKEN }}
+          # Chromium is installed only if a page needs it; X posts usually do not.
+          WEBPAGE_PARSER_INSTALL_BROWSER: '1'
+          CRAWL4AI_NO_CLOUD_NOTICE: '1'
+        run: python -m webpage_parser run --run-id "$REQUEST_ID"

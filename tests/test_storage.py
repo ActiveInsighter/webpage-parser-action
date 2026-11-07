@@ -1,22 +1,10 @@
-"""Exercise the actual migration, REST API, permissions and writer against isolated PocketBase."""
-import json
-import os
+"""Exercise the actual migrations, hooks, REST API, permissions and writer against isolated PocketBase."""
 import secrets
-import shutil
-import socket
-import subprocess
-import tempfile
-import time
 import unittest
-from pathlib import Path
-from urllib.error import HTTPError
-from urllib.request import Request, urlopen
 from unittest.mock import patch
 
-from storage import PocketBaseStore, StorageError
-
-ROOT = Path(__file__).resolve().parents[1]
-BINARY = os.getenv('POCKETBASE_BINARY') or shutil.which('pocketbase') or '/opt/pocketbase/pocketbase'
+from pocketbase_server import AVAILABLE, PocketBaseServer
+from webpage_parser.storage import PocketBaseStore, StorageError, content_rows
 
 
 class ConfigTests(unittest.TestCase):
@@ -27,67 +15,35 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 PocketBaseStore(url, token, owner)
 
+    def test_rows_keep_columns_out_of_metadata_and_prefer_page_markdown(self):
+        from test_x_parser import card, response
+        from webpage_parser.crawl import build_result
+        post = build_result(response(card('777')), 'https://x.com/alice/status/777', 'body', '', 'x', 1)
+        [row] = content_rows(post, 'a' * 15, 'social_media', 'req', 'b' * 15, 'c' * 15)
+        self.assertEqual((row['target'], row['run'], row['externalId'], row['content']), ('b' * 15, 'c' * 15, '777', '正文'))
+        self.assertFalse({'text', 'images', 'url', 'id'} & row['metadata'].keys())
+        self.assertEqual(row['metadata']['relation'], 'target')
+        page = {'mode': 'page', 'requested_url': 'https://example.com/', 'final_url': 'https://example.com/', 'title': 'T',
+                'fetched_at': '2026-11-07T00:00:00+00:00', 'items': ['flat text'], 'count': 1, 'selector': 'body',
+                'attribute': None, 'markdown': '# Heading'}
+        [web] = content_rows(page, 'a' * 15)
+        self.assertEqual((web['content'], web['metadata']['format']), ('# Heading', 'markdown'))
+        self.assertNotIn('target', web)
+        self.assertEqual(content_rows({**page, 'markdown': ''}, 'a' * 15)[0]['content'], 'flat text')
 
-@unittest.skipUnless(Path(BINARY).is_file(), 'Set POCKETBASE_BINARY to run real database tests')
+
+@unittest.skipUnless(AVAILABLE, 'Set POCKETBASE_BINARY to run real database tests')
 class PocketBaseIntegrationTests(unittest.TestCase):
     @classmethod
-    def api(cls, method, path, body=None, token=None):
-        req = Request(cls.base + path, data=json.dumps(body).encode() if body is not None else None,
-                      headers={'Content-Type': 'application/json', **({'Authorization': token} if token else {})}, method=method)
-        try:
-            with urlopen(req, timeout=5) as r:
-                return r.status, json.loads(r.read() or b'null')
-        except HTTPError as error:
-            with error:
-                return error.code, json.loads(error.read() or b'null')
-
-    @classmethod
     def setUpClass(cls):
-        cls.temp = tempfile.TemporaryDirectory(prefix='webpage-parser-pb-')
-        cls.addClassCleanup(cls.temp.cleanup)
-        folder = Path(cls.temp.name)
-        migrations = folder / 'migrations'
-        migrations.mkdir()
-        (migrations / '1000000000_clients.js').write_text('''migrate((app) => app.save(new Collection({
-            name: 'aw_clients', type: 'auth', passwordAuth: {enabled: true, identityFields: ['email']}
-        })), (app) => app.delete(app.findCollectionByNameOrId('aw_clients')));''')
-        shutil.copy2(ROOT / 'pocketbase/pb_migrations/1794045600_crawled_contents.js', migrations)
-        cls.command = [BINARY, '--dir=' + str(folder/'data'), '--migrationsDir=' + str(migrations), '--hooksDir=' + str(folder/'hooks')]
-        subprocess.run(cls.command + ['migrate', 'up'], capture_output=True, check=True)
-        password = secrets.token_urlsafe(24)
-        subprocess.run(cls.command + ['superuser', 'upsert', 'test@example.invalid', password], capture_output=True, check=True)
-        with socket.socket() as sock:
-            sock.bind(('127.0.0.1', 0))
-            port = sock.getsockname()[1]
-        cls.base = 'http://127.0.0.1:' + str(port)
-        cls.log = (folder/'server.log').open('w')
-        cls.addClassCleanup(cls.log.close)
-        cls.server = subprocess.Popen(cls.command + ['serve', '--http=127.0.0.1:' + str(port)], stdout=cls.log, stderr=cls.log)
-        def stop():
-            cls.server.terminate()
-            cls.server.wait(timeout=10)
-        cls.addClassCleanup(stop)
-        for _ in range(100):
-            try:
-                if cls.api('GET', '/api/health')[0] == 200:
-                    break
-            except OSError:
-                pass
-            time.sleep(.05)
-        else:
-            raise RuntimeError('Isolated PocketBase did not become healthy')
-        code, auth = cls.api('POST', '/api/collections/_superusers/auth-with-password', {'identity': 'test@example.invalid', 'password': password})
-        assert code == 200, auth
-        cls.admin = auth['token']
+        cls.server = PocketBaseServer()
+        cls.addClassCleanup(cls.server.stop)
+        cls.base, cls.admin, cls.api = cls.server.base, cls.server.admin, cls.server.api
         cls.owners, cls.tokens = [], []
         for label in ['one', 'two']:
-            pwd = secrets.token_urlsafe(24)
-            code, record = cls.api('POST', '/api/collections/aw_clients/records', {'email': label+'@example.invalid', 'password': pwd, 'passwordConfirm': pwd}, cls.admin)
-            assert code == 200, record
-            code, auth = cls.api('POST', '/api/collections/aw_clients/auth-with-password', {'identity': label+'@example.invalid', 'password': pwd})
-            assert code == 200, auth
-            cls.owners.append(record['id'])
-            cls.tokens.append(auth['token'])
+            owner, token = cls.server.user('aw_clients', label + '@example.invalid')
+            cls.owners.append(owner)
+            cls.tokens.append(token)
 
     def test_service_identity_writes_only_crawl_collection(self):
         password = secrets.token_urlsafe(24)
@@ -112,7 +68,7 @@ class PocketBaseIntegrationTests(unittest.TestCase):
         self.assertEqual(self.api('PATCH', '/api/collections/aw_crawler_services/records/' + record['id'], {'verified': True}, token)[0], 403)
 
     def page(self, post_id=None):
-        from parser import build_result
+        from webpage_parser.crawl import build_result
         from test_x_parser import card, response
         return build_result(response(card(post_id or secrets.randbelow(10**16))),
                             'https://x.com/alice/status/' + str(post_id or '123'), 'body', '', 'x', 1)

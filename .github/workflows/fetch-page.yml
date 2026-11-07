@@ -1,7 +1,6 @@
 name: Fetch webpage
+# Ad-hoc crawls. Scheduled crawling is driven by AnyWorkflow's scheduler through crawl-run.yml.
 on:
-  schedule:
-    - cron: '17 * * * *'
   workflow_dispatch:
     inputs:
       url:
@@ -119,12 +118,12 @@ jobs:
           url: ${{ inputs.url || vars.TARGET_URL || 'https://example.com' }}
           selector: ${{ inputs.selector || vars.PARSER_SELECTOR || 'body' }}
           attribute: ${{ inputs.attribute || vars.PARSER_ATTRIBUTE || '' }}
-          timeout: ${{ github.event_name != 'schedule' && format('{0}', inputs.timeout) || '30' }}
-          retries: ${{ github.event_name != 'schedule' && format('{0}', inputs.retries) || '2' }}
+          timeout: ${{ format('{0}', inputs.timeout) }}
+          retries: ${{ format('{0}', inputs.retries) }}
           mode: ${{ inputs.mode || vars.PARSER_MODE || 'auto' }}
           wait-for: ${{ inputs.wait_for || vars.PARSER_WAIT_FOR || '' }}
-          delay: ${{ github.event_name != 'schedule' && format('{0}', inputs.delay) || vars.PARSER_DELAY || '3' }}
-          max-posts: ${{ github.event_name != 'schedule' && format('{0}', inputs.max_posts) || vars.PARSER_MAX_POSTS || '1' }}
+          delay: ${{ format('{0}', inputs.delay) }}
+          max-posts: ${{ format('{0}', inputs.max_posts) }}
           options: ${{ inputs.options || vars.PARSER_OPTIONS || '{}' }}
           pocketbase-url: ${{ vars.POCKETBASE_URL || 'https://pb.any1.tech' }}
           pocketbase-token: ${{ secrets.WEBPAGE_POCKETBASE_TOKEN }}

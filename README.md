@@ -1,6 +1,8 @@
 # Webpage Parser Action
 
-在 GitHub Actions 中匿名抓取普通网页、X 帖子及回复，可直接保存到 AnyWorkflow 使用的 PocketBase。没有前端，不读取本机浏览器 Cookie，不使用第三方代抓服务或 LLM。
+在 GitHub Actions 中匿名抓取普通网页、X 帖子及回复，结果保存到 AnyWorkflow 使用的 PocketBase。不读取本机浏览器 Cookie，不使用第三方代抓服务或 LLM。
+
+日常使用在 AnyWorkflow Remote 的「网页抓取」页面：保存页面、选中后手动抓取或设定频率，AnyWorkflow-workers 的 scheduler 通过 `crawl-run.yml` 派发本仓库执行。`fetch-page.yml` 保留给单次调用和调试。
 
 项目位置：`/home/dev/Documents/Project/webpage-parser-action`。
 仓库：https://github.com/ActiveInsighter/webpage-parser-action
@@ -18,9 +20,27 @@
 
 匿名页面只能取得公开预览，无法保证完整回复、完整历史或完整长文；不自动滚动或登录。HTTP 200 而目标缺失、登录墙、删除或限流都可能失败。429 重试耗尽后不会再启动浏览器请求。`coverage=visible_only` 明确表达此限制。媒体保存 URL、视频可见 source/poster，不下载文件或保证可播放。
 
-## remote 调用
+## AnyWorkflow 抓取（crawl-run.yml）
 
-仍使用 `fetch-page.yml` 的 `workflow_dispatch`，保留原有九个输入，并以一个 `options` JSON 输入传递后端参数：
+```text
+Remote 选中页面 / 到期页面 ──▶ aw_crawl_runs（快照最多 10 个页面）
+scheduler ──workflow_dispatch(request_id)──▶ crawl-run.yml ──▶ python -m webpage_parser run --run-id ID
+  读取 run 快照 → 逐页抓取 → 写 aw_crawled_contents（关联 target/run）→ POST /report
+scheduler 按 run 名 webpage-crawl-<id> 对账，运行结束后 settle：没有回报的页面记为失败
+```
+
+- dispatch 只有 `request_id`（15 位记录 id）。链接、选项和归属都在 PocketBase，本仓库公开的运行日志只出现 id 和计数，不上传 artifact。
+- Action 用 `aw_crawler_services` 身份（Secret `WEBPAGE_POCKETBASE_TOKEN`）读取 run 快照、写内容、通过 `/report` 回报；它不能直接修改 run 或页面记录。
+- 每页写完立即回报。回报响应带 `cancelRequested` 时停止后续页面；任一页面失败时进程以非零退出，GitHub 运行显示失败，已成功的页面照常保存。
+- 抓取选项与 `fetch-page.yml` 相同（`selector`、`attribute`、`waitFor`、`delay`、`timeout`、`xScope`、`maxPosts`、`transport`），由 PocketBase 校验后快照；运行时拒绝未知或类型不对的选项（`invalid_options`）。
+- 只有需要渲染的页面才安装 Chromium（`WEBPAGE_PARSER_INSTALL_BROWSER=1`），X 帖子通常 HTTP 即可。
+- 错误码（`timeout`、`no_match`、`target_not_found`、`http_403` 等）随回报写入 run 和页面，Remote 据此显示原因。
+
+workflow 必须在默认分支上，`workflow_dispatch` 才能派发。
+
+## 单次调用（fetch-page.yml）
+
+`fetch-page.yml` 的 `workflow_dispatch` 保留原有九个输入，并以一个 `options` JSON 输入传递后端参数：
 
 ```bash
 gh workflow run fetch-page.yml \
@@ -81,11 +101,19 @@ curl --fail-with-body --request POST \
 
 不接受 JSON 中未知键、非字符串值或凭据。`options` 覆盖对应的独立 action / CLI 参数。
 
-定时任务每小时 UTC 第 17 分钟执行，使用仓库 Variables：`TARGET_URL`、`PARSER_MODE`、`PARSER_SELECTOR`、`PARSER_ATTRIBUTE`、`PARSER_WAIT_FOR`、`PARSER_DELAY`、`PARSER_MAX_POSTS`、`PARSER_OPTIONS`。手动/API 的数值参数优先，包括合法的零值。手动输入 options 默认 `{}`；定时配置中的入库选项不会隐式影响手动抓取。
+`fetch-page.yml` 不再自带 cron：定时抓取改由 AnyWorkflow scheduler 按每个页面的频率派发 `crawl-run.yml`。文字输入为空时仍回退到仓库 Variables（`TARGET_URL`、`PARSER_MODE`、`PARSER_SELECTOR`、`PARSER_ATTRIBUTE`、`PARSER_WAIT_FOR`、`PARSER_OPTIONS`）。
 
 ## 数据库
 
-新增 `aw_crawled_contents`，沿用现有 PocketBase，未引入另一套数据库。
+沿用 AnyWorkflow 的 PocketBase。结构由 [AnyWorkflow-workers](https://github.com/ActiveInsighter/AnyWorkflow-workers) 维护（`pocketbase/pb_migrations/1794045600_crawled_contents.js`、`1794120000_web_crawl.js` 和 `pb_hooks/aw_crawl.pb.js`、`crawl.js`、`crawl_validation.js`），随后端一起部署；本仓库不再保存迁移，也不再自行部署。
+
+| 集合 | 用途 |
+| --- | --- |
+| `aw_crawl_targets` | 用户保存的页面：链接、选项、分类、频率、下次时间、最近结果 |
+| `aw_crawl_runs` | 一次抓取：页面快照、每页结果、计数、GitHub run id |
+| `aw_crawled_contents` | 抓到的内容，按用户和内容身份去重 |
+
+`aw_crawled_contents` 字段：
 
 | 字段 | 用途 |
 | --- | --- |
@@ -97,25 +125,24 @@ curl --fail-with-body --request POST \
 | `fetchedAt`, `created`, `updated` | 抓取时间和记录时间 |
 | `media`, `metrics`, `metadata` | 图片/视频 URL、可见计数、完整结构化帖子及关系 |
 | `requestId`, `dedupeKey` | 调用关联标识、稳定内容身份的 SHA-256 |
+| `target`, `run` | 来源页面和抓取（`crawl-run.yml` 写入；单次调用为空） |
+| `contentHash`, `changedAt` | 正文的 SHA-256（服务端计算）；只有哈希变化时才更新 `changedAt` |
 
 唯一索引为 `(owner, dedupeKey)`：同一用户同一个 X status ID 重抓会更新原记录（含类型、来源、计数和 requestId）；不同用户分别保存。普通网页按最终 URL 去重。并发插入发生冲突或写入响应丢失时会查回记录再更新，不会创建重复行。多个请求同时更新同一内容时以最后成功写入为准，表保留当前内容，不是每次抓取的历史流水。失败抓取不入库；入库失败会使任务失败，同时保留正文和已写入的 record IDs，批量/多卡片写入不保证整体事务。
 
-普通用户只能访问自己的内容。`aw_crawler_services` 是独立机器身份，只在新内容集合上授予读、创建、更新权限；不能删除内容或管理用户、集合。Actions 使用其 token，未使用管理员 token。
-
-部署迁移：`pocketbase/pb_migrations/1794045600_crawled_contents.js`。已经同步到当前维护后端 `/home/dev/Documents/Project/AnyWorkflow-workers/.worktrees/retire-automa/pocketbase/pb_migrations/`。在现有本机部署上可执行：
+普通用户只能访问自己的内容。`aw_crawler_services` 是独立机器身份：能读写内容、读取抓取 run、调用 `/report`；不能删除内容、修改页面或管理用户和集合。Actions 使用其 token，未使用管理员 token。
 
 ```bash
-sudo -n python3 scripts/deploy_collection.py
 sudo -n python3 scripts/configure_crawler_secret.py
 ```
 
-第一个命令备份、在一致性副本上验证迁移与既有业务记录数，再仅安装本迁移并重启 PocketBase；已应用时不重复执行。第二个命令复用服务器现有管理凭据创建/续签受限抓取身份，并通过标准输入设置本仓库 `WEBPAGE_POCKETBASE_TOKEN` Secret。凭据保留于 root-only `/etc/anyworkflow/webpage-crawler.json`，不输出、不提交；token 有效 365 天，到期前重跑第二个命令。
+复用服务器现有管理凭据创建/续签受限抓取身份，并通过标准输入设置本仓库 `WEBPAGE_POCKETBASE_TOKEN` Secret。凭据保留于 root-only `/etc/anyworkflow/webpage-crawler.json`，不输出、不提交；token 有效 365 天，到期前重跑。
 
 workflow 从仓库 Variable `POCKETBASE_URL` 读取数据库 origin，缺省 `https://pb.any1.tech`。凭据只从 Secret 读取，不通过 dispatch 输入传递；仅抓取时不需要数据库凭据。
 
 ## 结果与复用
 
-附件保留 30 天：`result.json` 是结构化契约，`content.md` 仅含选中的内容；`page.html`、`page.md`、可用时的 `page.png` 是整个页面的诊断证据，可能含上下文。HTTP 模式没有截图，浏览器导航失败也可能没有截图。多地址证据为 `page-01.*` 等。
+以下是 `fetch-page.yml` 和组合 action 的结果；`crawl-run.yml` 不产生附件。附件保留 30 天：`result.json` 是结构化契约，`content.md` 仅含选中的内容；`page.html`、`page.md`、可用时的 `page.png` 是整个页面的诊断证据，可能含上下文。HTTP 模式没有截图，浏览器导航失败也可能没有截图。多地址证据为 `page-01.*` 等。
 
 单地址结果保留 `items/count/success`，增加 `schema_version=2`、`authenticated=false`、`transport`、`target_status_id`、`target`、`posts`、`coverage`、`request_id`；入库时增加 `storage.status/record_ids`。多地址在 `results[]` 中保留对应结果，顶层 `success` 为整体状态。抓取已成功但入库失败时，`crawl_success=true`、`success=false`。调用方必须检查成功状态，不以 count 判断成功。
 
@@ -148,9 +175,14 @@ gh run download RUN_ID --repo ActiveInsighter/webpage-parser-action --dir result
 python3.12 -m venv .venv
 .venv/bin/python -m pip install --require-hashes -r requirements.txt
 .venv/bin/python -m playwright install --with-deps chromium
-.venv/bin/python parser.py --url https://x.com/theo/status/2118569423653204185 --mode x
+.venv/bin/python -m webpage_parser --url https://x.com/theo/status/2118569423653204185 --mode x
+POCKETBASE_URL=… POCKETBASE_TOKEN=… .venv/bin/python -m webpage_parser run --run-id RUN_ID
 POCKETBASE_BINARY=/opt/pocketbase/pocketbase .venv/bin/python -m unittest discover -s tests -v
 ```
+
+代码在 `webpage_parser/`：`cli.py`（单次抓取）、`jobs.py`（`run` 模式）、`crawl.py` / `fetch.py` / `extract.py` / `x.py`（抓取与解析）、`options.py`（参数校验）、`storage.py` / `pocketbase.py`（入库）。`parser.py` 仅保留给组合 action 调用。
+
+数据库测试在临时 PocketBase 上运行后端的真实迁移和 hook，副本在 `tests/fixtures/pocketbase/`，不要手改：在 AnyWorkflow-workers 修改后运行 `python3 scripts/sync_pocketbase_fixtures.py ../AnyWorkflow-workers` 并一起提交。设置 `WORKERS_DIR` 时测试会校验副本与源一致。
 
 CLI 入库使用 `--save-to pocketbase --owner ID --content-type social_media --request-id ID`，数据库 origin 与 token 分别从 `POCKETBASE_URL`、`POCKETBASE_TOKEN` 环境变量读取；不接受 token 命令行参数。浏览器与结果目录均在项目内并已忽略。
 
