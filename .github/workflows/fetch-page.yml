@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: Webpage URL (empty uses TARGET_URL or example.com)
+        description: One URL or newline-separated URLs (max 10; empty uses TARGET_URL)
         type: string
         required: false
       selector:
@@ -17,13 +17,33 @@ on:
         type: string
         required: false
       timeout:
-        description: Connect/read timeout in seconds (1 to 120)
+        description: Browser navigation/wait timeout in seconds (1 to 120)
         type: number
         default: 30
       retries:
         description: Transient error retries (0 to 5)
         type: number
         default: 2
+      mode:
+        description: Extraction mode
+        type: choice
+        options:
+          - auto
+          - page
+          - x
+        default: auto
+      wait_for:
+        description: Optional CSS selector to wait for
+        type: string
+        required: false
+      delay:
+        description: Wait for dynamic content in seconds (0 to 30)
+        type: number
+        default: 3
+      max_posts:
+        description: Maximum X posts per page (1 to 50)
+        type: number
+        default: 5
 
 permissions:
   contents: read
@@ -31,7 +51,7 @@ permissions:
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -45,10 +65,15 @@ jobs:
           attribute: ${{ inputs.attribute || vars.PARSER_ATTRIBUTE || '' }}
           timeout: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.timeout) || '30' }}
           retries: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.retries) || '2' }}
-      - name: Upload JSON result
+          mode: ${{ inputs.mode || vars.PARSER_MODE || 'auto' }}
+          wait-for: ${{ inputs.wait_for || vars.PARSER_WAIT_FOR || '' }}
+          delay: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.delay) || vars.PARSER_DELAY || '3' }}
+          max-posts: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.max_posts) || vars.PARSER_MAX_POSTS || '5' }}
+      - name: Upload results and browser diagnostics
+        if: ${{ always() && !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: webpage-result-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ steps.parse.outputs.result-path }}
-          if-no-files-found: error
+          path: results/
+          if-no-files-found: warn
           retention-days: 30

@@ -1,12 +1,12 @@
 name: Webpage Parser
-description: Fetch an HTML page and extract text or attributes using CSS selectors
+description: Render webpages with Crawl4AI and extract CSS content or public X posts
 author: ActiveInsighter
 branding:
   icon: globe
   color: blue
 inputs:
   url:
-    description: Absolute HTTP or HTTPS webpage URL
+    description: One HTTP/HTTPS URL, or up to 10 newline-separated URLs
     required: true
   selector:
     description: CSS selector for the elements to extract
@@ -15,11 +15,23 @@ inputs:
     description: Attribute to extract (empty means text; href/src/action become absolute URLs)
     default: ''
   timeout:
-    description: Connect/read timeout in seconds (greater than 0, at most 120)
+    description: Browser navigation and CSS wait timeout in seconds (greater than 0, at most 120)
     default: '30'
   retries:
     description: Retry count for transient network and HTTP errors (0 to 5)
     default: '2'
+  mode:
+    description: auto detects X URLs; page extracts CSS; x extracts post cards
+    default: auto
+  wait-for:
+    description: Optional CSS selector to wait for before extracting
+    default: ''
+  delay:
+    description: Seconds to allow dynamic content to render (0 to 30)
+    default: '3'
+  max-posts:
+    description: Maximum X posts per page (1 to 50)
+    default: '5'
 outputs:
   count:
     description: Number of extracted items
@@ -42,13 +54,21 @@ runs:
         PARSER_ATTRIBUTE: ${{ inputs.attribute }}
         PARSER_TIMEOUT: ${{ inputs.timeout }}
         PARSER_RETRIES: ${{ inputs.retries }}
+        PARSER_MODE: ${{ inputs.mode }}
+        PARSER_WAIT_FOR: ${{ inputs.wait-for }}
+        PARSER_DELAY: ${{ inputs.delay }}
+        PARSER_MAX_POSTS: ${{ inputs.max-posts }}
+        CRAWL4AI_NO_CLOUD_NOTICE: '1'
       run: |
         set -euo pipefail
         parser_venv=$(mktemp -d "$RUNNER_TEMP/webpage-parser.XXXXXX")
         trap 'rm -rf "$parser_venv"' EXIT
         python -m venv "$parser_venv"
         "$parser_venv/bin/python" -m pip install --disable-pip-version-check --require-hashes -r "$ACTION_DIR/requirements.txt"
+        "$parser_venv/bin/python" -m playwright install --with-deps chromium
         "$parser_venv/bin/python" "$ACTION_DIR/parser.py" \
           --url "$PARSER_URL" --selector "$PARSER_SELECTOR" \
           --attribute "$PARSER_ATTRIBUTE" --timeout "$PARSER_TIMEOUT" \
-          --retries "$PARSER_RETRIES"
+          --retries "$PARSER_RETRIES" --mode "$PARSER_MODE" \
+          --wait-for "$PARSER_WAIT_FOR" --delay "$PARSER_DELAY" \
+          --max-posts "$PARSER_MAX_POSTS"
