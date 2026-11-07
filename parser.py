@@ -6,7 +6,12 @@ import base64
 import json
 import math
 import os
+import platform
 import re
+from contextlib import AsyncExitStack
+from types import SimpleNamespace
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 from datetime import datetime, timezone
 from importlib.metadata import version
 from pathlib import Path
@@ -15,7 +20,10 @@ from urllib.parse import urljoin, urlsplit
 from bs4 import BeautifulSoup
 from soupsieve import compile as compile_selector
 
-X_HOSTS = {"x.com", "www.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com"}
+from x_parser import X_HOSTS, extract_x_posts, select_x_content, status_identity
+from storage import PocketBaseStore
+
+MAX_RESPONSE_BYTES = 20 * 1024 * 1024
 TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
 
 
@@ -50,50 +58,6 @@ def extract(html, url, selector, attribute=""):
     return {"title": soup.title.get_text(" ", strip=True) if soup.title else "", "items": items}
 
 
-def extract_x_posts(html, max_posts=5):
-    """Only count rendered tweet cards with their own timestamp permalink."""
-    soup = BeautifulSoup(html, "html.parser")
-    posts, seen = [], set()
-    for card in soup.select('article'):
-        avatar = card.select_one('[data-post-avatar] a[href]')
-        if card.get("data-testid") != "tweet" and avatar is None:
-            continue
-        timestamp = card.select_one("time[datetime]")
-        link = timestamp.find_parent("a", href=True) if timestamp else None
-        if link is None and avatar:
-            # X's newer logged-out layout has date links instead of <time>.
-            for candidate in card.select('a[data-base-ui-tooltip-trigger][href*="/status/"]'):
-                if candidate["href"].startswith(avatar["href"] + "/status/") and "Views" not in candidate.get_text():
-                    link = candidate
-                    break
-        match = re.fullmatch(r"/([^/]+)/status/(\d+)(?:[/?].*)?", link["href"]) if link else None
-        if not match or match[2] in seen:
-            continue
-        text = card.select_one('[data-testid="tweetText"], div[dir="auto"].whitespace-pre-wrap')
-        images = list(dict.fromkeys(image["src"] for image in card.select('img[src]')
-                                   if urlsplit(image["src"]).hostname == "pbs.twimg.com"
-                                   and urlsplit(image["src"]).path.startswith("/media/")))
-        if text is None and not images and not card.select_one('video, [data-testid="videoPlayer"]'):
-            continue
-        author = card.select_one('[data-testid="User-Name"]')
-        posts.append({
-            "id": match[2], "url": f"https://x.com/{match[1]}/status/{match[2]}",
-            "handle": "@" + match[1],
-            "author": author.get_text(" ", strip=True) if author else "@" + match[1],
-            "text": text.get_text(" ", strip=True) if text else "",
-            "posted_at": timestamp["datetime"] if timestamp else None,
-            "posted_at_text": link.get_text(" ", strip=True), "images": images,
-        })
-        engagement = card.select_one('[role="group"][aria-label]')
-        if engagement:
-            posts[-1]["metrics"] = {label: int(number) for number, label in re.findall(
-                r"(\d+) (replies|reposts|likes|bookmarks|views)", engagement["aria-label"])}
-        seen.add(match[2])
-        if len(posts) >= max_posts:
-            break
-    return posts
-
-
 def validate_options(url, selector, timeout, retries, mode, wait_for, delay, max_posts):
     validate_url(url)
     if not selector.strip():
@@ -115,30 +79,36 @@ def validate_options(url, selector, timeout, retries, mode, wait_for, delay, max
         raise ValueError("x mode requires an x.com or twitter.com URL")
 
 
-def build_result(crawled, url, selector, attribute, mode, max_posts):
+def build_result(crawled, url, selector, attribute, mode, max_posts, x_scope="target", transport="browser"):
     html = crawled.html or ""
     final_url = crawled.redirected_url or url
     parsed = extract(html, final_url, selector, attribute)
     status = getattr(crawled, "redirected_status_code", None) or crawled.status_code
     ok = bool(crawled.success) and bool(status) and status < 400
     result = {
-        "engine": {"name": "Crawl4AI", "version": version("crawl4ai")},
+        "engine": {"name": "urllib" if transport == "http" else "Crawl4AI",
+                   "version": platform.python_version() if transport == "http" else version("crawl4ai")},
+        "schema_version": 2, "transport": transport, "authenticated": False,
         "mode": mode, "success": ok, "requested_url": url, "final_url": final_url,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "status_code": status, "selector": selector,
         "attribute": attribute or None, **parsed, "count": len(parsed["items"]),
     }
     if mode == "x":
-        posts = extract_x_posts(html, max_posts)
-        result.update(posts=posts, items=[post["text"] for post in posts], count=len(posts), source="x-browser")
+        posts, target, error_code = select_x_content(html, url, max_posts, x_scope)
+        result.update(posts=posts, target=target, target_status_id=(status_identity(url) or {}).get("id"),
+                      x_scope=x_scope, items=[post["text"] for post in posts], count=len(posts), source="x-" + transport,
+                      coverage="visible_only", warnings=["Anonymous preview only; completeness of replies is not guaranteed."])
         result["success"] = ok and bool(posts)
+        if error_code:
+            result["error_code"] = error_code
     if not result["success"]:
         soup = BeautifulSoup(html, "html.parser")
         for node in soup.select("script, style, noscript"):
             node.decompose()
         result["diagnostics"] = {
             "error": crawled.error_message or (
-                "No rendered X post cards found; inspect HTML/screenshot for login, unavailable post or error page."
+                "Requested X status was not found in public cards; inspect evidence for login, unavailable content or layout changes."
                 if mode == "x" and ok else "Browser navigation failed or returned an HTTP error."
             ),
             "page_text_preview": soup.get_text(" ", strip=True)[:1500],
@@ -157,12 +127,26 @@ def save_evidence(crawled, prefix):
 
 
 async def crawl_page(crawler, url, selector="body", attribute="", timeout=30, retries=2,
-                     mode="auto", wait_for="", delay=3, max_posts=5, evidence=None):
+                     mode="auto", wait_for="", delay=3, max_posts=1, evidence=None,
+                     x_scope="target", transport="browser"):
     from crawl4ai import CacheMode, CrawlerRunConfig
 
     validate_options(url, selector, timeout, retries, mode, wait_for, delay, max_posts)
     if mode == "auto":
         mode = "x" if urlsplit(url).hostname in X_HOSTS else "page"
+    if x_scope not in ("target", "visible") or transport not in ("auto", "http", "browser"):
+        raise ValueError("invalid x-scope or transport")
+    if mode == "x" and x_scope == "target" and not status_identity(url):
+        raise ValueError("target scope requires a status URL; use x-scope=visible for profiles")
+    if transport == "http" and wait_for:
+        raise ValueError("wait-for requires the browser transport")
+    if transport == "http" or (transport == "auto" and mode == "x" and not wait_for):
+        crawled = await asyncio.to_thread(fetch_http, url, timeout, retries)
+        http_result = build_result(crawled, url, selector, attribute, mode, max_posts, x_scope, "http")
+        if evidence:
+            save_evidence(crawled, evidence)
+        if transport == "http" or http_result["success"] or crawled.status_code == 429:
+            return http_result
     config = CrawlerRunConfig(
         cache_mode=CacheMode.BYPASS, wait_until="domcontentloaded",
         page_timeout=int(timeout * 1000), wait_for="css:" + wait_for if wait_for else None,
@@ -178,20 +162,57 @@ async def crawl_page(crawler, url, selector="body", attribute="", timeout=30, re
         await asyncio.sleep(min(2 ** attempt, 8))
     if evidence:
         save_evidence(crawled, evidence)
-    return build_result(crawled, url, selector, attribute, mode, max_posts)
+    return build_result(crawled, url, selector, attribute, mode, max_posts, x_scope, "browser")
+
+
+def fetch_http(url, timeout, retries):
+    """Fresh anonymous requests, bounded body; no cookie jar or external proxy service."""
+    import time
+    for attempt in range(retries + 1):
+        try:
+            request = Request(url, headers={"User-Agent": "WebpageParser/2.0", "Accept": "text/html", "Accept-Language": "en"})
+            try:
+                response = urlopen(request, timeout=timeout)
+            except HTTPError as error:
+                response = error
+            with response:
+                status = response.code
+                raw = response.read(MAX_RESPONSE_BYTES + 1)
+                if len(raw) > MAX_RESPONSE_BYTES:
+                    raise ValueError("HTTP response exceeds 20 MiB")
+                html = raw.decode(response.headers.get_content_charset() or "utf-8", errors="replace")
+                result = SimpleNamespace(html=html, status_code=status, redirected_url=response.geturl(),
+                                         success=status < 400, error_message="", markdown=None, screenshot=None)
+            if status not in TRANSIENT_STATUSES or attempt == retries:
+                return result
+        except (URLError, TimeoutError, OSError):
+            if attempt == retries:
+                return SimpleNamespace(html="", status_code=None, redirected_url=url, success=False,
+                                       error_message="Anonymous HTTP request failed", markdown=None, screenshot=None)
+        time.sleep(min(2 ** attempt, 8))
 
 
 async def crawl_urls(urls, evidence_dir, **options):
     from crawl4ai import AsyncWebCrawler, BrowserConfig
 
-    browser = BrowserConfig(headless=True, ignore_https_errors=False, verbose=False,
-                            viewport_width=1280, viewport_height=900)
     results = []
-    async with AsyncWebCrawler(config=browser, base_directory=str(Path.cwd())) as crawler:
+    # Start Chromium only when HTTP cannot extract the target, or it is explicitly requested.
+    async with AsyncExitStack() as stack:
+        class LazyBrowser:
+            crawler = None
+
+            async def arun(self, **kwargs):
+                if self.crawler is None:
+                    browser = BrowserConfig(headless=True, ignore_https_errors=False, verbose=False,
+                                            viewport_width=1280, viewport_height=900)
+                    self.crawler = await stack.enter_async_context(AsyncWebCrawler(config=browser, base_directory=str(Path.cwd())))
+                return await self.crawler.arun(**kwargs)
+
+        crawler = LazyBrowser()
         for index, url in enumerate(urls, 1):
             page = Path(evidence_dir) / ("page" if len(urls) == 1 else f"page-{index:02d}")
             try:
-                budget = (options["timeout"] * 2 + options["delay"] + 20) * (options["retries"] + 1)
+                budget = (options["timeout"] * 3 + options["delay"] + 30) * (options["retries"] + 1)
                 async with asyncio.timeout(budget):
                     result = await crawl_page(crawler, url, evidence=page, **options)
             except Exception as error:
@@ -199,6 +220,32 @@ async def crawl_urls(urls, evidence_dir, **options):
                           "items": [], "diagnostics": {"error": f"{type(error).__name__}: {error}"}}
             results.append(result)
     return results
+
+
+OPTION_KEYS = {"x_scope", "transport", "save_to", "content_type", "owner", "request_id"}
+
+
+def apply_json_options(args):
+    try:
+        options = json.loads(args.options)
+    except ValueError:
+        raise ValueError("options must be a JSON object") from None
+    if not isinstance(options, dict) or options.keys() - OPTION_KEYS:
+        raise ValueError("options contains unknown keys; allowed: " + ", ".join(sorted(OPTION_KEYS)))
+    for key, value in options.items():
+        if not isinstance(value, str):
+            raise ValueError("options values must be strings")
+        setattr(args, key, value)
+    if args.x_scope not in ("target", "visible"):
+        raise ValueError("x_scope must be target or visible")
+    if args.transport not in ("auto", "http", "browser"):
+        raise ValueError("transport must be auto, http or browser")
+    if args.save_to not in ("none", "pocketbase"):
+        raise ValueError("save_to must be none or pocketbase")
+    if not args.content_type.strip() or len(args.content_type) > 64:
+        raise ValueError("content_type must contain 1 to 64 characters")
+    if len(args.request_id) > 128 or re.search(r"[\x00-\x1f]", args.request_id):
+        raise ValueError("request_id must be at most 128 characters without control characters")
 
 
 def main(argv=None):
@@ -211,7 +258,15 @@ def main(argv=None):
     cli.add_argument("--mode", choices=("auto", "page", "x"), default="auto")
     cli.add_argument("--wait-for", default="", help="Optional CSS selector to wait for")
     cli.add_argument("--delay", type=float, default=3)
-    cli.add_argument("--max-posts", type=int, default=5)
+    cli.add_argument("--max-posts", type=int, default=1)
+    cli.add_argument("--x-scope", default="target", choices=("target", "visible"))
+    cli.add_argument("--transport", default="auto", choices=("auto", "http", "browser"))
+    cli.add_argument("--save-to", default="none", choices=("none", "pocketbase"))
+    cli.add_argument("--content-type", default="social_media")
+    cli.add_argument("--owner", default="")
+    cli.add_argument("--request-id", default="")
+    cli.add_argument("--options", default="{}", help="JSON overrides for workflow dispatch")
+    cli.add_argument("--pocketbase-url", default=os.getenv("POCKETBASE_URL", ""))
     cli.add_argument("--output", default="results/result.json")
     args = cli.parse_args(argv)
     output = Path(args.output)
@@ -222,6 +277,8 @@ def main(argv=None):
             stale.unlink()
     urls = [url.strip() for url in args.url.splitlines() if url.strip()]
     try:
+        apply_json_options(args)
+        store = PocketBaseStore(args.pocketbase_url, os.getenv("POCKETBASE_TOKEN", ""), args.owner) if args.save_to == "pocketbase" else None
         if not 1 <= len(urls) <= 10:
             raise ValueError("provide between 1 and 10 URLs, separated by newlines")
         for url in urls:
@@ -231,17 +288,35 @@ def main(argv=None):
             urls, selector=args.selector, attribute=args.attribute, timeout=args.timeout,
             retries=args.retries, mode=args.mode, wait_for=args.wait_for,
             delay=args.delay, max_posts=args.max_posts, evidence_dir=output.parent,
+            x_scope=args.x_scope, transport=args.transport,
         ))
+        for page in pages:
+            if store:
+                try:
+                    page["storage"] = store.save(page, args.content_type, args.request_id)
+                except Exception as error:
+                    page["storage"] = {"status": "failed", "error": str(error), "record_ids": getattr(error, "record_ids", [])}
+                    page["crawl_success"] = page["success"]
+                    page["success"] = False
+            page["request_id"] = args.request_id
     except Exception as error:
         pages = [{"success": False, "count": 0, "diagnostics": {"error": f"{type(error).__name__}: {error}"}}]
     result = pages[0] if len(pages) == 1 else {
+        "schema_version": 2, "request_id": args.request_id,
         "success": all(page["success"] for page in pages),
         "count": sum(page["count"] for page in pages), "results": pages,
     }
+    content = "\n\n".join("\n\n".join([page.get("requested_url", ""), *page.get("items", [])]) for page in pages)
+    output.with_name("content.md").write_text(content + "\n", encoding="utf-8")
     output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     if os.getenv("GITHUB_OUTPUT"):
         with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
             handle.write(f"count={result['count']}\n")
+            handle.write(f"success={str(result['success']).lower()}\n")
+            ids = [rid for page in pages for rid in page.get('storage', {}).get('record_ids', [])]
+            handle.write("record-ids=" + json.dumps(ids) + "\n")
+            safe_request_id = args.request_id if len(args.request_id) <= 128 and not re.search(r"[\x00-\x1f]", args.request_id) else ""
+            handle.write("request-id=" + safe_request_id + "\n")
     if os.getenv("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
             handle.write(f"Crawl4AI: success={result['success']}, extracted items={result['count']}. See JSON, Markdown, HTML and screenshot artifacts.\n")

@@ -43,7 +43,56 @@ on:
       max_posts:
         description: Maximum X posts per page (1 to 50)
         type: number
-        default: 5
+        default: 1
+      options:
+        description: 'JSON: x_scope, transport, save_to, content_type, owner, request_id'
+        type: string
+        required: false
+        default: '{}'
+  workflow_call:
+    inputs:
+      url:
+        type: string
+        required: true
+      selector:
+        type: string
+        default: body
+      attribute:
+        type: string
+        default: ''
+      timeout:
+        type: number
+        default: 30
+      retries:
+        type: number
+        default: 2
+      mode:
+        type: string
+        default: auto
+      wait_for:
+        type: string
+        default: ''
+      delay:
+        type: number
+        default: 3
+      max_posts:
+        type: number
+        default: 1
+      options:
+        type: string
+        default: '{}'
+    secrets:
+      WEBPAGE_POCKETBASE_TOKEN:
+        required: false
+    outputs:
+      count:
+        value: ${{ jobs.fetch.outputs.count }}
+      record_ids:
+        value: ${{ jobs.fetch.outputs.record_ids }}
+      request_id:
+        value: ${{ jobs.fetch.outputs.request_id }}
+      success:
+        value: ${{ jobs.fetch.outputs.success }}
 
 permissions:
   contents: read
@@ -52,9 +101,16 @@ jobs:
   fetch:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    outputs:
+      count: ${{ steps.parse.outputs.count }}
+      record_ids: ${{ steps.parse.outputs.record-ids }}
+      request_id: ${{ steps.parse.outputs.request-id }}
+      success: ${{ steps.parse.outputs.success }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
           persist-credentials: false
       - name: Fetch and parse
         id: parse
@@ -63,12 +119,15 @@ jobs:
           url: ${{ inputs.url || vars.TARGET_URL || 'https://example.com' }}
           selector: ${{ inputs.selector || vars.PARSER_SELECTOR || 'body' }}
           attribute: ${{ inputs.attribute || vars.PARSER_ATTRIBUTE || '' }}
-          timeout: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.timeout) || '30' }}
-          retries: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.retries) || '2' }}
+          timeout: ${{ github.event_name != 'schedule' && format('{0}', inputs.timeout) || '30' }}
+          retries: ${{ github.event_name != 'schedule' && format('{0}', inputs.retries) || '2' }}
           mode: ${{ inputs.mode || vars.PARSER_MODE || 'auto' }}
           wait-for: ${{ inputs.wait_for || vars.PARSER_WAIT_FOR || '' }}
-          delay: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.delay) || vars.PARSER_DELAY || '3' }}
-          max-posts: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.max_posts) || vars.PARSER_MAX_POSTS || '5' }}
+          delay: ${{ github.event_name != 'schedule' && format('{0}', inputs.delay) || vars.PARSER_DELAY || '3' }}
+          max-posts: ${{ github.event_name != 'schedule' && format('{0}', inputs.max_posts) || vars.PARSER_MAX_POSTS || '1' }}
+          options: ${{ inputs.options || vars.PARSER_OPTIONS || '{}' }}
+          pocketbase-url: ${{ vars.POCKETBASE_URL || 'https://pb.any1.tech' }}
+          pocketbase-token: ${{ secrets.WEBPAGE_POCKETBASE_TOKEN }}
       - name: Upload results and browser diagnostics
         if: ${{ always() && !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

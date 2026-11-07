@@ -94,7 +94,7 @@ class ExtractionTests(unittest.TestCase):
             self.assertEqual(status, 1)
             self.assertEqual(json.loads(target.read_text())["count"], 1)
             self.assertFalse(evidence.exists())
-            self.assertEqual(Path(os.environ["GITHUB_OUTPUT"]).read_text(), "count=1\n")
+            self.assertIn("count=1\n", Path(os.environ["GITHUB_OUTPUT"]).read_text())
 
     def test_bad_input_leaves_diagnostic_not_stale_success(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -114,7 +114,7 @@ class CrawlerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_retries_for_login_wall(self):
         crawler = SimpleNamespace(arun=AsyncMock(return_value=crawled("Log in")))
-        result = await crawl_page(crawler, "https://x.com/NASA", retries=2)
+        result = await crawl_page(crawler, "https://x.com/NASA/status/456", retries=2)
         self.assertFalse(result["success"])
         self.assertEqual(crawler.arun.await_count, 1)
 

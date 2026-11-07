@@ -4,3 +4,4 @@ __pycache__/
 results/
 .ruff_cache/
 .crawl4ai/
+.test-bin/

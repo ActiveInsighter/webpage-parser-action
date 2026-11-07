@@ -1,28 +1,46 @@
-# Webpage Parser Action · Crawl4AI
+# Webpage Parser Action
 
-在 GitHub Actions runner 内运行开源 **Crawl4AI 0.9.5 + Chromium**，渲染 JavaScript 后提取内容，无需 Crawl4AI Cloud API Key 或 LLM。支持普通网页 CSS 提取与公开 X 帖子提取。
+在 GitHub Actions 中匿名抓取普通网页、X 帖子及回复，可直接保存到 AnyWorkflow 使用的 PocketBase。没有前端，不读取本机浏览器 Cookie，不使用第三方代抓服务或 LLM。
 
+项目位置：`/home/dev/Documents/Project/webpage-parser-action`。
 仓库：https://github.com/ActiveInsighter/webpage-parser-action
 
-## 远程抓取 X 帖子
+## X 链接匹配
+
+默认 `mode=auto`、`x_scope=target`、`transport=auto`：
+
+1. 从 X / Twitter 链接解析 status ID，支持跟踪参数、`/photo/N`、`/video/N`、`/i/status/ID` 和 `/i/web/status/ID`。
+2. 先匿名 HTTP 读取公开 HTML；缺少目标时使用 Crawl4AI 0.9.5 + 全新 Chromium 上下文渲染。普通网页默认使用 Chromium。
+3. 扫描帖子卡片，排除嵌入引用帖，去重后按 ID 匹配；限制数量在匹配之后应用。
+4. 默认只返回目标。因此回复页先显示上文原帖时，仍返回链接指向的回复。目标缺失即失败，不用邻近内容代替。
+
+`x_scope=visible` 可返回目标及页面上其他公开卡片，目标始终排第一，数量受 `max_posts` 限制；主页也须显式使用该范围。其他卡片标记 `relation=visible`，不能据页面顺序认定它们都是回复。未明确提供回复关系时，`is_reply` 和 `reply_to_status_id` 为 `null`。
+
+匿名页面只能取得公开预览，无法保证完整回复、完整历史或完整长文；不自动滚动或登录。HTTP 200 而目标缺失、登录墙、删除或限流都可能失败。429 重试耗尽后不会再启动浏览器请求。`coverage=visible_only` 明确表达此限制。媒体保存 URL、视频可见 source/poster，不下载文件或保证可播放。
+
+## remote 调用
+
+仍使用 `fetch-page.yml` 的 `workflow_dispatch`，保留原有九个输入，并以一个 `options` JSON 输入传递后端参数：
 
 ```bash
 gh workflow run fetch-page.yml \
   --repo ActiveInsighter/webpage-parser-action --ref main \
-  -f url='https://x.com/jack/status/20' \
-  -f mode=x -f max_posts=1 -f delay=5 -f timeout=45 -f retries=0
+  -f url='https://x.com/theo/status/2118569423653204185' \
+  -f mode=x -f max_posts=1 \
+  -f options='{"x_scope":"target","transport":"auto","request_id":"remote-crawl-001"}'
 ```
 
-一次抓取多条链接，将 `url` 设为换行分隔的字符串（最多 10 个地址）。例如从 Bash 发起：
+抓取并入库，`owner` 替换为当前用户的 `aw_clients` 记录 ID：
 
 ```bash
 gh workflow run fetch-page.yml \
   --repo ActiveInsighter/webpage-parser-action --ref main \
-  -f url=$'https://x.com/jack/status/20\nhttps://x.com/NASA/status/2041557036274475228\nhttps://x.com/OpenAI/status/2047376561205325845' \
-  -f mode=x -f max_posts=1 -f delay=5 -f timeout=45 -f retries=0
+  -f url='https://x.com/theo/status/2118569423653204185' \
+  -f mode=x \
+  -f options='{"save_to":"pocketbase","owner":"OWNER_RECORD_ID","content_type":"social_media","request_id":"remote-crawl-001"}'
 ```
 
-从普通 HTTP 客户端调用，预先在环境中设置 `GH_TOKEN`：
+HTTP 调用示例，`GH_TOKEN` 须有本仓库 Actions write 权限：
 
 ```bash
 curl --fail-with-body --request POST \
@@ -30,97 +48,99 @@ curl --fail-with-body --request POST \
   --header 'Accept: application/vnd.github+json' \
   --header 'Content-Type: application/json' \
   'https://api.github.com/repos/ActiveInsighter/webpage-parser-action/actions/workflows/fetch-page.yml/dispatches' \
-  --data '{"ref":"main","inputs":{"url":"https://x.com/jack/status/20","mode":"x","max_posts":"1","delay":"5","timeout":"45","retries":"0"}}'
+  --data '{"ref":"main","inputs":{"url":"https://x.com/theo/status/2118569423653204185","mode":"x","options":"{\"save_to\":\"pocketbase\",\"owner\":\"OWNER_RECORD_ID\",\"content_type\":\"social_media\",\"request_id\":\"remote-crawl-001\"}"}}'
 ```
 
-令牌必须有权触发本仓库的工作流：fine-grained PAT 选择本仓库并授予 **Actions: write**。不要将令牌放入公开代码。任务异步运行，触发响应不直接返回抓取内容。
+调用是异步的，派发响应不直接返回正文。Remote 后端应从已验证会话确定 `owner`，生成 `request_id`，派发后轮询 GitHub run，或查询 PocketBase 的 `owner + requestId` 获取入库结果。`request_id` 用于关联；派发调用超时时需先对账，不保证 GitHub 任务只执行一次。内容入库另有稳定去重键。
 
-## 获取结果
+批量把 `url` 设为换行分隔的字符串，最多 10 条；任一抓取或入库失败，任务整体失败，其他地址的成功结果仍保留。
 
-```bash
-gh run list --repo ActiveInsighter/webpage-parser-action \
-  --workflow fetch-page.yml --event workflow_dispatch --limit 5
-# 将 RUN_ID 替换为对应运行 ID；并发请求时核对时间及输入参数。
-gh run watch RUN_ID --repo ActiveInsighter/webpage-parser-action --exit-status
-gh run download RUN_ID --repo ActiveInsighter/webpage-parser-action --dir results
-```
+## 参数
 
-HTTP 客户端可查询 `/repos/ActiveInsighter/webpage-parser-action/actions/runs/{run_id}/artifacts`，再跟随附件的 `archive_download_url` 重定向下载 ZIP。
-
-成功或失败都会尽量保留附件 30 天，不自动提交结果到仓库：
-
-- `result.json`：结构化结果、成功状态和失败诊断。
-- `page.html`：Chromium 渲染后的 DOM。
-- `page.md`：Crawl4AI 生成的 Markdown。
-- `page.png`：浏览器截图；导航失败时可能没有截图。
-
-多地址任务对应 `page-01.*`、`page-02.*` 等；JSON 使用 `results` 数组，每项对应一个输入地址。单地址保持原来的顶层 `items`、`count`、`title` 等字段，并新增 `engine`、`mode`、`success`。
-
-X 模式额外输出 `posts`：帖子 ID、原始链接、账号、可见正文、发布时间、图片 URL，以及页面提供的互动计数。旧版 DOM 的 `posted_at` 为 ISO 时间；新版仅显示日期文字时，保留 `posted_at_text`，`posted_at` 为 `null`，不推测时区。互动数据只是抓取时的快照。
-
-X 模式仅统计识别到的帖子卡片；登录提示、错误页或空白页会设置 `success: false` 并使任务失败。批量任务任一地址失败时整体失败，同时保留其他地址的成功结果。
-
-## 可修改参数
-
-| 远程输入 | 默认值 | 说明 |
+| workflow 输入 | 默认值 | 说明 |
 | --- | --- | --- |
-| `url` | `TARGET_URL`，否则 `https://example.com` | 一个 URL 或换行分隔的多个 URL，最多 10 个 |
-| `mode` | `PARSER_MODE`，否则 `auto` | `auto` 按域名判断；`page` 普通网页；`x` 帖子卡片 |
-| `selector` | `PARSER_SELECTOR`，否则 `body` | 普通网页的 CSS 选择器 |
-| `attribute` | `PARSER_ATTRIBUTE`，否则空 | 普通网页：空表示文字；可填 `href`、`src`、`content` 等 |
-| `timeout` | `30` | 导航及可选 CSS 等待的超时秒数，范围 (0,120] |
-| `retries` | `2` | 网络/导航失败、429 或临时 5xx 的重试次数，0–5 |
-| `wait_for` | `PARSER_WAIT_FOR`，否则空 | 等待指定 CSS 元素出现；不接受 JavaScript 代码 |
-| `delay` | `3` | 等待动态内容渲染的额外秒数，0–30 |
-| `max_posts` | `5` | 每个页面最多返回多少条可见帖子，1–50 |
+| `url` | `vars.TARGET_URL` 或 example.com | 一个或换行分隔的多个 URL |
+| `mode` | auto | auto / page / x |
+| `selector` | body | 普通网页 CSS 选择器 |
+| `attribute` | 空 | 普通网页属性名；空表示文字 |
+| `timeout` | 30 | 单次导航/等待或 HTTP 请求秒数，(0,120] |
+| `retries` | 2 | 临时 HTTP / 网络错误重试，0–5 |
+| `wait_for` | 空 | CSS 等待；auto 将直接使用浏览器，http 不支持 |
+| `delay` | 3 | 浏览器额外渲染等待，0–30 秒；HTTP 不等待 |
+| `max_posts` | 1 | visible 范围最多 1–50 条；target 始终一条 |
+| `options` | `{}` | 以下 JSON 配置，所有值均为字符串 |
 
-X 模式使用专门的卡片提取规则，`selector` 和 `attribute` 用于普通网页模式。帖子详情页可能显示回复，`max_posts=1` 通常只返回首条原帖。该参数限制返回数量，不保证页面加载到这么多条；当前不自动滚动或翻页。
+| options 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `x_scope` | target | target / visible |
+| `transport` | auto | auto / http / browser |
+| `save_to` | none | none / pocketbase；启用但写入失败时任务失败 |
+| `content_type` | social_media | 类型，可改成 `社交媒体` 或其他 1–64 字符的分类 |
+| `owner` | 空 | 启用入库时必填，15 字符的 aw_clients ID |
+| `request_id` | 空 | 调用方关联标识，至多 128 字符，无控制字符 |
 
-未提供或为空的字符串会回退到仓库 Variables。手动任务的数值输入使用界面/API 的值；定时任务的 `delay`、`max_posts` 可由 `PARSER_DELAY`、`PARSER_MAX_POSTS` 控制，导航超时和重试默认 30 秒、2 次。
+不接受 JSON 中未知键、非字符串值或凭据。`options` 覆盖对应的独立 action / CLI 参数。
 
-## 普通网页与定时任务
+定时任务每小时 UTC 第 17 分钟执行，使用仓库 Variables：`TARGET_URL`、`PARSER_MODE`、`PARSER_SELECTOR`、`PARSER_ATTRIBUTE`、`PARSER_WAIT_FOR`、`PARSER_DELAY`、`PARSER_MAX_POSTS`、`PARSER_OPTIONS`。手动/API 的数值参数优先，包括合法的零值。手动输入 options 默认 `{}`；定时配置中的入库选项不会隐式影响手动抓取。
+
+## 数据库
+
+新增 `aw_crawled_contents`，沿用现有 PocketBase，未引入另一套数据库。
+
+| 字段 | 用途 |
+| --- | --- |
+| `owner` | 所属 aw_clients 用户；删除用户时级联清理 |
+| `type`, `platform` | 可编辑内容类型，以及 x / web 来源平台 |
+| `source`, `canonicalUrl`, `externalId` | 原始输入链接、规范内容链接、X status ID |
+| `content`, `title` | 正文与页面标题；无正文的媒体帖允许空正文 |
+| `author`, `handle`, `publishedAt` | 作者、账号和明确给出的发布时间 |
+| `fetchedAt`, `created`, `updated` | 抓取时间和记录时间 |
+| `media`, `metrics`, `metadata` | 图片/视频 URL、可见计数、完整结构化帖子及关系 |
+| `requestId`, `dedupeKey` | 调用关联标识、稳定内容身份的 SHA-256 |
+
+唯一索引为 `(owner, dedupeKey)`：同一用户同一个 X status ID 重抓会更新原记录（含类型、来源、计数和 requestId）；不同用户分别保存。普通网页按最终 URL 去重。并发插入发生冲突或写入响应丢失时会查回记录再更新，不会创建重复行。多个请求同时更新同一内容时以最后成功写入为准，表保留当前内容，不是每次抓取的历史流水。失败抓取不入库；入库失败会使任务失败，同时保留正文和已写入的 record IDs，批量/多卡片写入不保证整体事务。
+
+普通用户只能访问自己的内容。`aw_crawler_services` 是独立机器身份，只在新内容集合上授予读、创建、更新权限；不能删除内容或管理用户、集合。Actions 使用其 token，未使用管理员 token。
+
+部署迁移：`pocketbase/pb_migrations/1794045600_crawled_contents.js`。已经同步到当前维护后端 `/home/dev/Documents/Project/AnyWorkflow-workers/.worktrees/retire-automa/pocketbase/pb_migrations/`。在现有本机部署上可执行：
 
 ```bash
-gh workflow run fetch-page.yml \
-  --repo ActiveInsighter/webpage-parser-action \
-  -f url='https://example.com' -f mode=page -f selector=title
+sudo -n python3 scripts/deploy_collection.py
+sudo -n python3 scripts/configure_crawler_secret.py
 ```
 
-每小时第 17 分钟（UTC）自动运行，读取仓库 **Settings → Secrets and variables → Actions → Variables**。例如：
+第一个命令备份、在一致性副本上验证迁移与既有业务记录数，再仅安装本迁移并重启 PocketBase；已应用时不重复执行。第二个命令复用服务器现有管理凭据创建/续签受限抓取身份，并通过标准输入设置本仓库 `WEBPAGE_POCKETBASE_TOKEN` Secret。凭据保留于 root-only `/etc/anyworkflow/webpage-crawler.json`，不输出、不提交；token 有效 365 天，到期前重跑第二个命令。
+
+workflow 从仓库 Variable `POCKETBASE_URL` 读取数据库 origin，缺省 `https://pb.any1.tech`。凭据只从 Secret 读取，不通过 dispatch 输入传递；仅抓取时不需要数据库凭据。
+
+## 结果与复用
+
+附件保留 30 天：`result.json` 是结构化契约，`content.md` 仅含选中的内容；`page.html`、`page.md`、可用时的 `page.png` 是整个页面的诊断证据，可能含上下文。HTTP 模式没有截图，浏览器导航失败也可能没有截图。多地址证据为 `page-01.*` 等。
+
+单地址结果保留 `items/count/success`，增加 `schema_version=2`、`authenticated=false`、`transport`、`target_status_id`、`target`、`posts`、`coverage`、`request_id`；入库时增加 `storage.status/record_ids`。多地址在 `results[]` 中保留对应结果，顶层 `success` 为整体状态。抓取已成功但入库失败时，`crawl_success=true`、`success=false`。调用方必须检查成功状态，不以 count 判断成功。
 
 ```bash
-gh variable set TARGET_URL --body 'https://x.com/jack/status/20' --repo ActiveInsighter/webpage-parser-action
-gh variable set PARSER_MODE --body 'x' --repo ActiveInsighter/webpage-parser-action
-gh variable set PARSER_MAX_POSTS --body '1' --repo ActiveInsighter/webpage-parser-action
+gh run list --repo ActiveInsighter/webpage-parser-action --workflow fetch-page.yml --limit 5
+gh run watch RUN_ID --repo ActiveInsighter/webpage-parser-action --exit-status
+gh run download RUN_ID --repo ActiveInsighter/webpage-parser-action --dir results/remote
 ```
 
-频率在 [.github/workflows/fetch-page.yml](.github/workflows/fetch-page.yml) 修改。GitHub 定时任务可能延迟，公开仓库长期无活动时也可能自动停用。单次工作流上限为 20 分钟，包括依赖和浏览器安装。
-
-## 在其他工作流复用
+组合 action 支持所有原参数，新增 `x-scope`、`transport`、`save-to`、`content-type`、`owner`、`request-id`、`options`、`pocketbase-url`、`pocketbase-token`；远程 workflow 和 JSON 使用下划线。输出 `count`、`success`、`record-ids`（JSON 数组）、`request-id`、`result-path`。失败步骤之后读取输出时需使用 `if: always()`。
 
 ```yaml
-permissions:
-  contents: read
-jobs:
-  crawl:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: ActiveInsighter/webpage-parser-action@main
-        id: webpage
-        with:
-          url: https://x.com/jack/status/20
-          mode: x
-          max-posts: '1'
-          delay: '5'
-      - if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: crawl-results
-          path: results/
+- uses: ActiveInsighter/webpage-parser-action@main
+  id: crawl
+  with:
+    url: https://x.com/theo/status/2118569423653204185
+    save-to: pocketbase
+    content-type: social_media
+    owner: ${{ vars.CRAWL_OWNER_ID }}
+    request-id: remote-crawl-001
+    pocketbase-url: https://pb.any1.tech
+    pocketbase-token: ${{ secrets.WEBPAGE_POCKETBASE_TOKEN }}
 ```
 
-正式使用建议将 `main` 替换为审核后的提交 SHA。Action 使用 Linux runner，通过临时 Python 虚拟环境安装锁定依赖并安装 Chromium，提供 `count` 和 `result-path` 输出。组合 Action 参数使用 `wait-for`、`max-posts`；远程 workflow 输入使用 `wait_for`、`max_posts`。
+也支持跨仓库 `workflow_call`，输入与 dispatch 相同，显式传入 `WEBPAGE_POCKETBASE_TOKEN` secret；job 输出为 `count/success/record_ids/request_id`。抓取仓库需允许调用方访问；正式调用推荐固定已验证的提交 SHA。
 
 ## 本地开发
 
@@ -128,12 +148,12 @@ jobs:
 python3.12 -m venv .venv
 .venv/bin/python -m pip install --require-hashes -r requirements.txt
 .venv/bin/python -m playwright install --with-deps chromium
-.venv/bin/python parser.py --url https://x.com/jack/status/20 --mode x --max-posts 1 --delay 5
-.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python parser.py --url https://x.com/theo/status/2118569423653204185 --mode x
+POCKETBASE_BINARY=/opt/pocketbase/pocketbase .venv/bin/python -m unittest discover -s tests -v
 ```
 
-更新依赖后使用 `uv pip compile requirements.in --python-version 3.12 --generate-hashes -o requirements.txt` 重新生成锁文件。浏览器缓存、日志放在项目 `.crawl4ai/` 下，抓取结果在 `results/`，均不提交。
+CLI 入库使用 `--save-to pocketbase --owner ID --content-type social_media --request-id ID`，数据库 origin 与 token 分别从 `POCKETBASE_URL`、`POCKETBASE_TOKEN` 环境变量读取；不接受 token 命令行参数。浏览器与结果目录均在项目内并已忽略。
 
-当前使用未登录浏览器直接访问 X，无外部代抓服务，也未自动使用本机账号 Cookie。能否看到帖子取决于 X 返回的页面；登录要求、访问限制、已删除帖子或 DOM 变化仍可能导致失败。图片仅保存 URL，不下载原图或视频。公开仓库的日志及结果只适合处理公开内容。
+CI 安装校验 SHA-256 的 PocketBase 0.39.10，在临时数据库验证真实迁移、权限、唯一索引和写入；本机也验证 0.40.4。没有 PocketBase 二进制时本地数据库测试会明确跳过，CI 不跳过。更新 Python 依赖后，用 `uv pip compile requirements.in --python-version 3.12 --generate-hashes -o requirements.txt` 重生成锁文件。
 
-参考：[Crawl4AI 开源库](https://github.com/unclecode/crawl4ai)、[浏览器配置](https://docs.crawl4ai.com/api/parameters/)、[动态内容等待](https://docs.crawl4ai.com/core/page-interaction/)、[GitHub 远程触发 API](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event)。
+参考：[PocketBase migrations](https://pocketbase.io/docs/js-migrations/)、[API rules](https://pocketbase.io/docs/api-rules-and-filters/)、[Crawl4AI 动态页面](https://docs.crawl4ai.com/core/page-interaction/)、[GitHub workflow dispatch](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event)。
