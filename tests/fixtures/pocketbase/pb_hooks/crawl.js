@@ -121,7 +121,8 @@ function recordOutcome(tx, targetId, runId, outcome, now) {
   target.set('lastError', outcome.status === 'failed' ? outcome.error : '');
   target.set('lastErrorCode', outcome.status === 'failed' ? outcome.errorCode : '');
   target.set('lastItemCount', outcome.itemCount);
-  if (outcome.title) target.set('pageTitle', outcome.title);
+  // Only a page that crawled names it: a failure's title is usually the error page's.
+  if (outcome.status === 'succeeded' && outcome.title) target.set('pageTitle', outcome.title);
   tx.save(target);
 }
 
