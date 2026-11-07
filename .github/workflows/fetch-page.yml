@@ -1,0 +1,54 @@
+name: Fetch webpage
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      url:
+        description: Webpage URL (empty uses TARGET_URL or example.com)
+        type: string
+        required: false
+      selector:
+        description: CSS selector (empty uses PARSER_SELECTOR or body)
+        type: string
+        required: false
+      attribute:
+        description: Attribute name (empty uses PARSER_ATTRIBUTE or text extraction)
+        type: string
+        required: false
+      timeout:
+        description: Connect/read timeout in seconds (1 to 120)
+        type: number
+        default: 30
+      retries:
+        description: Transient error retries (0 to 5)
+        type: number
+        default: 2
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Fetch and parse
+        id: parse
+        uses: ./
+        with:
+          url: ${{ inputs.url || vars.TARGET_URL || 'https://example.com' }}
+          selector: ${{ inputs.selector || vars.PARSER_SELECTOR || 'body' }}
+          attribute: ${{ inputs.attribute || vars.PARSER_ATTRIBUTE || '' }}
+          timeout: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.timeout) || '30' }}
+          retries: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.retries) || '2' }}
+      - name: Upload JSON result
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: webpage-result-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.parse.outputs.result-path }}
+          if-no-files-found: error
+          retention-days: 30
