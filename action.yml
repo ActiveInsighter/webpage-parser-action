@@ -1,0 +1,54 @@
+name: Webpage Parser
+description: Fetch an HTML page and extract text or attributes using CSS selectors
+author: ActiveInsighter
+branding:
+  icon: globe
+  color: blue
+inputs:
+  url:
+    description: Absolute HTTP or HTTPS webpage URL
+    required: true
+  selector:
+    description: CSS selector for the elements to extract
+    default: body
+  attribute:
+    description: Attribute to extract (empty means text; href/src/action become absolute URLs)
+    default: ''
+  timeout:
+    description: Connect/read timeout in seconds (greater than 0, at most 120)
+    default: '30'
+  retries:
+    description: Retry count for transient network and HTTP errors (0 to 5)
+    default: '2'
+outputs:
+  count:
+    description: Number of extracted items
+    value: ${{ steps.parse.outputs.count }}
+  result-path:
+    description: JSON result path relative to the workspace
+    value: results/result.json
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      with:
+        python-version: '3.12'
+    - id: parse
+      shell: bash
+      env:
+        ACTION_DIR: ${{ github.action_path }}
+        PARSER_URL: ${{ inputs.url }}
+        PARSER_SELECTOR: ${{ inputs.selector }}
+        PARSER_ATTRIBUTE: ${{ inputs.attribute }}
+        PARSER_TIMEOUT: ${{ inputs.timeout }}
+        PARSER_RETRIES: ${{ inputs.retries }}
+      run: |
+        set -euo pipefail
+        parser_venv=$(mktemp -d "$RUNNER_TEMP/webpage-parser.XXXXXX")
+        trap 'rm -rf "$parser_venv"' EXIT
+        python -m venv "$parser_venv"
+        "$parser_venv/bin/python" -m pip install --disable-pip-version-check --require-hashes -r "$ACTION_DIR/requirements.txt"
+        "$parser_venv/bin/python" "$ACTION_DIR/parser.py" \
+          --url "$PARSER_URL" --selector "$PARSER_SELECTOR" \
+          --attribute "$PARSER_ATTRIBUTE" --timeout "$PARSER_TIMEOUT" \
+          --retries "$PARSER_RETRIES"
