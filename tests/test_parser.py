@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from webpage_parser.cli import main
-from webpage_parser.crawl import build_result, crawl_page, crawl_urls
+from webpage_parser.crawl import build_result, crawl_page, crawl_urls, is_bot_challenge
 from webpage_parser.extract import extract
 from webpage_parser.options import validate_options
 from webpage_parser.x import extract_x_posts
@@ -75,6 +75,20 @@ class ExtractionTests(unittest.TestCase):
         result = build_result(crawled(NEW_POST, 403), "https://x.com/NASA", "body", "", "x", 5)
         self.assertFalse(result["success"])
 
+    def test_bot_challenge_is_blocked_not_empty(self):
+        challenge = ('<html><head><title>Just a moment...</title></head><body>' + NEW_POST +
+                     '<script src="/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1"></script></body></html>')
+        for mode in ("x", "page"):
+            result = build_result(crawled(challenge, 403), "https://x.com/NASA", "body", "", mode, 5, "visible", "http")
+            self.assertFalse(result["success"])
+            self.assertEqual(result["error_code"], "blocked")
+            self.assertEqual(result["count"], 0)
+            self.assertIn("anti-bot", result["diagnostics"]["error"])
+        flagged = crawled("<title>x</title>", 200)
+        flagged.error_message = "Blocked by anti-bot protection: Cloudflare JS challenge"
+        self.assertTrue(is_bot_challenge(flagged))
+        self.assertFalse(is_bot_challenge(crawled(NEW_POST)))
+
     def test_validation(self):
         defaults = dict(url="https://example.com", selector="body", timeout=30, retries=2,
                         mode="auto", wait_for="", delay=3, max_posts=5)
@@ -115,6 +129,14 @@ class CrawlerTests(unittest.IsolatedAsyncioTestCase):
             result = await crawl_page(crawler, "https://example.com", retries=1)
         self.assertTrue(result["success"])
         self.assertEqual(crawler.arun.await_count, 2)
+
+    async def test_bot_check_over_http_skips_the_browser(self):
+        challenge = crawled('<title>Just a moment...</title><body>Checking</body>', 403, success=False)
+        crawler = SimpleNamespace(arun=AsyncMock(return_value=crawled(NEW_POST)))
+        with patch("webpage_parser.crawl.fetch_http", return_value=challenge):
+            result = await crawl_page(crawler, "https://x.com/NASA", mode="x", max_posts=5, x_scope="visible", transport="auto")
+        self.assertEqual(result["error_code"], "blocked")
+        self.assertEqual(crawler.arun.await_count, 0)
 
     async def test_no_retries_for_login_wall(self):
         crawler = SimpleNamespace(arun=AsyncMock(return_value=crawled("Log in")))

@@ -15,6 +15,23 @@ from .options import validate_options
 from .x import X_HOSTS, select_x_content, status_identity
 
 
+# Interstitials that stand in for the page: a bot check answers instead of the site.
+CHALLENGE_TITLES = ("just a moment...", "attention required! | cloudflare", "access denied")
+CHALLENGE_MARKERS = ("challenges.cloudflare.com", "/cdn-cgi/challenge-platform/", "cf-chl-", "_cf_chl_opt")
+
+
+def is_bot_challenge(crawled):
+    """Whether the response is an anti-bot check rather than the page (Cloudflare and the like)."""
+    if "anti-bot" in (getattr(crawled, "error_message", "") or "").lower():
+        return True
+    html = crawled.html or ""
+    title = BeautifulSoup(html[:20000], "html.parser").title
+    if title and (title.get_text() or "").strip().lower() in CHALLENGE_TITLES:
+        return True
+    head = html[:50000]
+    return any(marker in head for marker in CHALLENGE_MARKERS)
+
+
 def build_result(crawled, url, selector, attribute, mode, max_posts, x_scope="target", transport="browser"):
     html = crawled.html or ""
     final_url = crawled.redirected_url or url
@@ -42,12 +59,19 @@ def build_result(crawled, url, selector, attribute, mode, max_posts, x_scope="ta
         result["success"] = ok and bool(posts)
         if error_code:
             result["error_code"] = error_code
+    if is_bot_challenge(crawled):
+        # Whatever was parsed belongs to the check page, not the site.
+        result.update(success=False, error_code="blocked", items=[], count=0)
+        if mode == "x":
+            result.update(posts=[], target=None)
     if not result["success"]:
         soup = BeautifulSoup(html, "html.parser")
         for node in soup.select("script, style, noscript"):
             node.decompose()
         result["diagnostics"] = {
             "error": crawled.error_message or (
+                "The site answered with an anti-bot check instead of the page." if result.get("error_code") == "blocked" else None
+            ) or (
                 "Requested X status was not found in public cards; inspect evidence for login, unavailable content or layout changes."
                 if mode == "x" and ok else "Browser navigation failed or returned an HTTP error."
             ),
@@ -75,7 +99,8 @@ async def crawl_page(crawler, url, selector="body", attribute="", timeout=30, re
         http_result = build_result(crawled, url, selector, attribute, mode, max_posts, x_scope, "http")
         if evidence:
             save_evidence(crawled, evidence)
-        if transport == "http" or http_result["success"] or crawled.status_code == 429:
+        # A bot check over HTTP meets the browser too: it answers by network address, not client.
+        if transport == "http" or http_result["success"] or crawled.status_code == 429 or http_result.get("error_code") == "blocked":
             return http_result
     config = CrawlerRunConfig(
         cache_mode=CacheMode.BYPASS, wait_until="domcontentloaded",
