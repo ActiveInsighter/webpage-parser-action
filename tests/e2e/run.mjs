@@ -13,6 +13,7 @@ import { startFixtureSite } from '../support/fixture-site.mjs'
 import { sleep, startHarness } from './harness.mjs'
 import { freePort } from '../support/pocketbase.mjs'
 
+const VERSION = JSON.parse(readFileSync(join(import.meta.dirname, '../../package.json'), 'utf8')).version
 const remoteDir = process.env.REMOTE_DIR && resolve(process.env.REMOTE_DIR)
 const screenshots = process.env.SCREENSHOT_DIR && resolve(process.env.SCREENSHOT_DIR)
 const only = process.argv.slice(2)
@@ -227,7 +228,7 @@ const cases = {
   'the worker reports in': async () => {
     const { items } = await pb.call('/api/collections/aw_crawl_workers/records', { token: pb.token, method: 'GET' })
     assert.equal(items.length, 1)
-    assert.equal(items[0].version, JSON.parse(readFileSync(join(import.meta.dirname, '../../package.json'), 'utf8')).version)
+    assert.equal(items[0].version, VERSION)
     assert.match(items[0].label, /^Chrome/u)
   },
   'a killed service worker closes its orphaned page and keeps working': async () => {
@@ -273,19 +274,29 @@ async function driveRemote() {
     await page.addInitScript(([token, id, baseUrl]) => {
       localStorage.setItem('anyworkflow.auth.session.v1', JSON.stringify({ token, record: { id }, baseUrl }))
     }, [pb.token, pb.ownerId, pb.base])
+    // The old address leads to the merged page.
     await page.goto(`${base}/page-capture`)
-    await page.getByRole('heading', { name: '网页采集' }).waitFor()
-    await page.getByText('扩展在线').waitFor({ timeout: 15_000 })
+    await page.waitForURL((url) => url.pathname === '/crawl')
+    await page.getByRole('heading', { name: '网页采集', exact: true }).waitFor()
+    await page.getByText(`扩展在线 · v${VERSION}`).waitFor({ timeout: 15_000 })
 
-    // Finished rows from the cases above are already listed; the real page is what matters here.
+    // Finished jobs from the cases above are already listed; the real records are what matters here.
     await page.getByRole('button', { name: '查看内容' }).first().waitFor()
     if (screenshots) await page.screenshot({ path: join(screenshots, 'remote-list.png') })
     await page.getByRole('button', { name: '查看内容' }).first().click()
-    await page.getByRole('tab', { name: '正文' }).waitFor()
-    await page.getByText('Markdown', { exact: true }).waitFor()
+    const sheet = page.getByRole('dialog')
+    await sheet.getByRole('tab', { name: '正文', selected: true }).waitFor()
+    await sheet.getByRole('tab', { name: 'Markdown' }).waitFor()
     if (screenshots) await page.screenshot({ path: join(screenshots, 'remote-result.png') })
-    await page.getByRole('tab', { name: '信息' }).click()
-    await page.getByText('解析方式').waitFor()
+    await sheet.getByRole('tab', { name: '信息' }).click()
+    await sheet.getByText('解析方式').waitFor()
+    await sheet.getByText('已登录的浏览器').waitFor()
+    await page.keyboard.press('Escape')
+
+    // The same documents are listed by content.
+    await page.getByRole('tab', { name: '内容', exact: true }).click()
+    await page.getByRole('combobox', { name: '按分类筛选' }).waitFor()
+    await page.locator('article').first().waitFor()
     assert.deepEqual(errors, [])
     await page.close()
   } finally {
