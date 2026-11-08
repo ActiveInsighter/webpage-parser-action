@@ -1,0 +1,40 @@
+name: CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      POCKETBASE_BINARY: ${{ github.workspace }}/.test-bin/pocketbase
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      # Unit tests, the server contract, type check, layer check and both builds.
+      - run: npm run preflight
+      - name: Install pinned PocketBase for the end-to-end suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .test-bin
+          curl --fail --location --retry 2 --output .test-bin/pocketbase.zip \
+            https://github.com/pocketbase/pocketbase/releases/download/v0.39.10/pocketbase_0.39.10_linux_amd64.zip
+          echo '67f68c8041dbb6a35fd7af5997ffc5063a7a7b96bf9df810360788f9e9975408  .test-bin/pocketbase.zip' | sha256sum --check
+          unzip -q .test-bin/pocketbase.zip pocketbase -d .test-bin
+          chmod +x .test-bin/pocketbase
+      - run: npx playwright install --with-deps chromium
+      - name: Cloud executor end to end
+        run: npm run test:cloud
+        env:
+          CRAWLER_E2E: '1'
+      - name: Browser extension end to end
+        run: npm run test:e2e

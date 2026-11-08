@@ -1,0 +1,45 @@
+name: Crawl
+# The scheduler (AnyWorkflow-workers, crawl-dispatch) finds this run by its name: keep `crawl-<dispatch id>`.
+run-name: crawl-${{ inputs.dispatch_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      dispatch_id:
+        description: AnyWorkflow crawl dispatch id (aw_crawl_dispatches). Jobs are claimed from PocketBase.
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    # The crawler stops claiming after CRAWLER_BUDGET_MINUTES so running pages can finish.
+    timeout-minutes: 45
+    steps:
+      - name: Check dispatch id
+        env:
+          DISPATCH_ID: ${{ inputs.dispatch_id }}
+        run: '[[ "$DISPATCH_ID" =~ ^[a-z0-9]{15}$ ]] || { echo "::error::dispatch_id must be a 15-character record id"; exit 1; }'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Build the cloud executor
+        run: npm run build:action
+      # Results go to PocketBase only and the log prints ids and counts: this repository's runs are
+      # public. Google Chrome comes with the runner image, so no browser is downloaded.
+      - name: Crawl
+        env:
+          DISPATCH_ID: ${{ inputs.dispatch_id }}
+          POCKETBASE_URL: ${{ vars.POCKETBASE_URL || 'https://pb.any1.tech' }}
+          CRAWLER_TOKEN: ${{ secrets.WEBPAGE_POCKETBASE_TOKEN }}
+          CRAWLER_CHROME_CHANNEL: chrome
+          CRAWLER_BUDGET_MINUTES: '30'
+        run: node dist/action/crawler.mjs dispatch --id "$DISPATCH_ID"

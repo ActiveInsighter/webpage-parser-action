@@ -1,43 +1,124 @@
-// Validation and schedule arithmetic for web crawling, free of PocketBase globals so it can be unit
-// tested. The crawler (webpage-parser-action, webpage_parser/jobs.py) checks the same options again
-// on the runner; rejecting here gives the owner the error at the moment they save a target.
-/* global __hooks */
-const capture = require(typeof __hooks === 'undefined' ? './capture_validation.js' : `${__hooks}/capture_validation.js`);
+// Validation and schedule arithmetic for crawling, free of PocketBase globals so it can be unit
+// tested. Jobs are remote input: a browser job is opened in a browser signed in to real accounts.
+// The crawler applies the same rules again before it opens anything (AnyWorkflow Crawler:
+// src/core/url-policy.ts and src/core/contract.ts); rejecting here tells the owner at once.
+//
+// Keep in step with the crawler: option names and bounds, error codes and which of them retry,
+// result field limits. Its contract test reads this file.
+const MAX_URL = 2048;
+const MAX_SELECTOR = 500;
+const MAX_SELECTORS = 20;
+const MAX_IDENTITY = 2048;
+const MAX_ITEMS = 200;
+const LOCAL_SUFFIXES = ['.localhost', '.local', '.internal', '.intranet', '.lan', '.home.arpa'];
+const CONTROL = /[\u0000-\u001f\u007f]/;
 
-const MODES = ['auto', 'page', 'x'];
+const RUNNERS = ['cloud', 'browser'];
+const SCOPES = ['target', 'visible'];
 const TRANSPORTS = ['auto', 'http', 'browser'];
-const X_SCOPES = ['target', 'visible'];
 const X_HOSTS = ['x.com', 'www.x.com', 'mobile.x.com', 'twitter.com', 'www.twitter.com', 'mobile.twitter.com'];
 const X_STATUS_PATH = /^\/(?:[A-Za-z0-9_]{1,15}\/status|i\/(?:web\/)?status)\/\d+(?:\/(?:photo|video)\/\d+)?\/?$/;
-const ATTRIBUTE = /^[A-Za-z_:][-A-Za-z0-9_:.]{0,99}$/;
-const RECORD_ID = /^[a-z0-9]{15}$/;
-const ERROR_CODE = /^[a-z0-9_]{1,64}$/;
-const CONTROL = /[\u0000-\u001f\u007f]/;
-const MAX_SELECTOR = 500;
-const MAX_ITEMS_PER_TARGET = 1000;
-const MAX_RECORD_IDS = 100;
+
+/** Error codes a crawler may report, and whether the server queues another attempt. */
+const ERROR_CODES = {
+  URL_BLOCKED: false,
+  NAVIGATION_FAILED: true,
+  HTTP_ERROR: true,
+  NOT_FOUND: false,
+  LOGIN_REQUIRED: false,
+  CAPTCHA: false,
+  ACCESS_DENIED: false,
+  UNSUPPORTED_CONTENT: false,
+  EMPTY_CONTENT: true,
+  TARGET_NOT_FOUND: false,
+  STEP_FAILED: false,
+  TIMEOUT: true,
+  PAGE_GONE: true,
+  CANCELED: false,
+  INTERNAL: true,
+  // Set by the server, never by a crawler.
+  LEASE_LOST: true,
+  NO_WORKER: false,
+};
+const MAX_ATTEMPTS = 3;
+const RETRY_BASE_MS = 30_000;
+/** Below this score a result is `partial`: something was read, and a person should check it. */
+const ACCEPTABLE_SCORE = 40;
 
 const MIN_INTERVAL_MINUTES = 30;
 const MAX_INTERVAL_MINUTES = 7 * 24 * 60;
-const MAX_TARGETS_PER_RUN = 10;
 const MINUTE = 60_000;
 
 function iso(ms) {
   return new Date(ms).toISOString();
 }
 
-function text(value, label, { min = 0, max }) {
+function isPrivateIpv4(host) {
+  const parts = host.split('.').map(Number);
+  const [a, b] = parts;
+  return a === 0 || a === 10 || a === 127 || (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 198 && (b === 18 || b === 19)) || a >= 224;
+}
+
+function isLocalHost(host) {
+  if (host.startsWith('[')) {
+    const address = host.slice(1, -1);
+    return address === '::' || address === '::1' || /^f[cd]/.test(address) || /^fe[89ab]/.test(address) || address.startsWith('::ffff:');
+  }
+  const name = host.replace(/\.$/, '');
+  if (name === 'localhost' || !name.includes('.') || LOCAL_SUFFIXES.some(suffix => name.endsWith(suffix))) return true;
+  // Browsers read a host ending in a number as an IPv4 address (127.1, 0x7f.0.0.1, 2130706433).
+  const last = name.split('.').pop();
+  if (/^(?:\d+|0x[0-9a-f]*)$/.test(last)) {
+    if (!/^\d{1,3}(?:\.\d{1,3}){3}$/.test(name) || name.split('.').some(part => Number(part) > 255)) return true;
+    return isPrivateIpv4(name);
+  }
+  return false;
+}
+
+/**
+ * http(s) only, no credentials, no local or private address. Scheme and host are lowercased and
+ * the fragment dropped, so one page is one target.
+ */
+function normalizeUrl(raw) {
+  const value = typeof raw === 'string' ? raw.trim() : '';
+  if (!value) throw new Error('请填写链接');
+  if (value.length > MAX_URL) throw new Error('链接过长');
+  const match = /^(https?):\/\/([^/?#\s]+)([/?#]\S*)?$/i.exec(value);
+  if (!match) throw new Error('只支持 http 和 https 链接');
+  const authority = match[2];
+  if (authority.includes('@')) throw new Error('链接不能包含账号或密码');
+  const host = authority.replace(/:\d*$/, '').toLowerCase();
+  if (!host || isLocalHost(host)) throw new Error('不能抓取本机或内网地址');
+  const rest = (match[3] || '').replace(/#.*$/, '');
+  return { url: `${match[1].toLowerCase()}://${authority.toLowerCase()}${rest || '/'}`, host };
+}
+
+function isXHost(host) {
+  return X_HOSTS.includes(host);
+}
+
+/** Only links that name one post can be matched exactly; other X pages need the visible scope. */
+function isXStatusUrl(url) {
+  const match = /^https?:\/\/[^/?#]+([^?#]*)/i.exec(url);
+  return Boolean(match) && X_STATUS_PATH.test(match[1] || '/');
+}
+
+function text(value, label, max, min = 0) {
   const result = typeof value === 'string' ? value.trim() : '';
   if (result.length < min || result.length > max || CONTROL.test(result)) throw new Error(`${label}无效`);
   return result;
 }
 
-function number(value, label, { min, max, integer = false, minExclusive = false }) {
-  const result = typeof value === 'string' && value.trim() ? Number(value) : value;
-  const valid = typeof result === 'number' && Number.isFinite(result) && (minExclusive ? result > min : result >= min) &&
-    result <= max && (!integer || Number.isInteger(result));
-  if (!valid) throw new Error(`${label}无效`);
-  return result;
+function selector(value, label) {
+  if (typeof value !== 'string' || !value.trim() || value.length > MAX_SELECTOR || CONTROL.test(value)) throw new Error(`${label}无效`);
+  return value.trim();
+}
+
+function integer(value, label, min, max) {
+  const number = typeof value === 'string' && value.trim() ? Number(value) : value;
+  if (!Number.isInteger(number) || number < min || number > max) throw new Error(`${label}应为 ${min}–${max}`);
+  return number;
 }
 
 function oneOf(value, values, label) {
@@ -45,73 +126,67 @@ function oneOf(value, values, label) {
   return value;
 }
 
-function isXHost(host) {
-  return X_HOSTS.includes(host);
-}
-
-/** Only https links that name one post can be matched exactly; profiles need the visible scope. */
-function isXStatusUrl(url) {
-  const match = /^https?:\/\/[^/?#]+([^?#]*)/i.exec(url);
-  return Boolean(match) && X_STATUS_PATH.test(match[1] || '/');
-}
-
-/** Same URL rules as page capture; scheme and host lowercased, fragment dropped: one page, one target. */
-function normalizeUrl(raw) {
-  const { url, host } = capture.normalizeUrl(raw);
-  const canonical = url.replace(/#.*$/, '').replace(/^[^:]+:\/\/[^/?#]+/, origin => origin.toLowerCase());
-  return { url: canonical, host };
-}
+const OPTION_KEYS = ['waitFor', 'contentSelector', 'removeSelectors', 'scroll', 'keepHtml', 'generic', 'timeoutSeconds', 'scope', 'maxItems', 'transport'];
 
 /**
- * Crawl options in the record's camelCase; the crawler maps them to its own flags. Empty values are
- * dropped so a target only stores what its owner set.
+ * Per-job overrides. Selectors and numbers only: a job never carries code. Empty values are
+ * dropped so a record stores only what its owner set.
  */
 function normalizeOptions(raw) {
   if (raw === undefined || raw === null || raw === '') return {};
   if (typeof raw !== 'object' || Array.isArray(raw)) throw new Error('抓取选项无效');
-  const allowed = ['selector', 'attribute', 'waitFor', 'delay', 'timeout', 'xScope', 'maxPosts', 'transport'];
-  if (Object.keys(raw).some(key => !allowed.includes(key))) throw new Error('抓取选项包含未知参数');
+  if (Object.keys(raw).some(key => !OPTION_KEYS.includes(key))) throw new Error('抓取选项包含未知参数');
   const options = {};
-  const set = (key, value) => {
-    if (value !== '' && value !== undefined && value !== null) options[key] = value;
-  };
-  set('selector', text(raw.selector, '选择器', { max: MAX_SELECTOR }));
-  const attribute = text(raw.attribute, '属性名', { max: 100 });
-  if (attribute && !ATTRIBUTE.test(attribute)) throw new Error('属性名无效');
-  set('attribute', attribute);
-  set('waitFor', text(raw.waitFor, '等待元素', { max: MAX_SELECTOR }));
-  if (raw.delay !== undefined && raw.delay !== '') set('delay', number(raw.delay, '渲染等待', { min: 0, max: 30 }));
-  if (raw.timeout !== undefined && raw.timeout !== '') set('timeout', number(raw.timeout, '超时', { min: 0, max: 120, minExclusive: true }));
-  if (raw.xScope !== undefined && raw.xScope !== '') set('xScope', oneOf(raw.xScope, X_SCOPES, 'X 范围'));
-  if (raw.maxPosts !== undefined && raw.maxPosts !== '') set('maxPosts', number(raw.maxPosts, '帖子数量', { min: 1, max: 50, integer: true }));
-  if (raw.transport !== undefined && raw.transport !== '') set('transport', oneOf(raw.transport, TRANSPORTS, '抓取方式'));
+  const present = key => raw[key] !== undefined && raw[key] !== null && raw[key] !== '';
+  if (present('waitFor')) options.waitFor = selector(raw.waitFor, '等待元素');
+  if (present('contentSelector')) options.contentSelector = selector(raw.contentSelector, '正文选择器');
+  if (raw.removeSelectors !== undefined && raw.removeSelectors !== null) {
+    if (!Array.isArray(raw.removeSelectors) || raw.removeSelectors.length > MAX_SELECTORS) throw new Error('移除元素无效');
+    const list = raw.removeSelectors.map(value => selector(value, '移除元素'));
+    if (list.length) options.removeSelectors = list;
+  }
+  for (const key of ['scroll', 'keepHtml', 'generic']) {
+    if (raw[key] === undefined || raw[key] === null) continue;
+    if (typeof raw[key] !== 'boolean') throw new Error('抓取选项无效');
+    if (raw[key]) options[key] = true;
+  }
+  if (present('timeoutSeconds')) options.timeoutSeconds = integer(raw.timeoutSeconds, '超时时间（秒）', 10, 280);
+  if (present('scope')) options.scope = oneOf(raw.scope, SCOPES, '读取范围');
+  if (present('maxItems')) options.maxItems = integer(raw.maxItems, '条目数量', 1, 50);
+  if (present('transport')) options.transport = oneOf(raw.transport, TRANSPORTS, '云端读取方式');
   return options;
 }
 
+function defaultCategory(host) {
+  return isXHost(host) ? 'social_media' : 'webpage';
+}
+
+/**
+ * What a job or target asks for, checked as a whole. Options that only one executor reads are
+ * dropped for the other, so the stored record says what will really happen.
+ */
+function normalizeRequest(input) {
+  const { url, host } = normalizeUrl(input.url);
+  const runner = oneOf(input.runner || 'cloud', RUNNERS, '执行位置');
+  const options = normalizeOptions(input.options);
+  if (runner === 'browser') delete options.transport;
+  if (options.transport === 'http' && (options.waitFor || options.scroll)) throw new Error('等待元素和滚动需要浏览器读取');
+  if (isXHost(host) && !isXStatusUrl(url) && options.scope !== 'visible') throw new Error('X 主页需要把读取范围设为「页面上的帖子」');
+  const category = text(input.category, '分类', 64) || defaultCategory(host);
+  return { url, host, runner, options, category };
+}
+
 function normalizeInterval(value) {
-  const minutes = value === undefined || value === null || value === '' ? 0 : number(value, '抓取频率', { min: 0, max: MAX_INTERVAL_MINUTES, integer: true });
+  const minutes = value === undefined || value === null || value === '' ? 0 : integer(value, '抓取频率（分钟）', 0, MAX_INTERVAL_MINUTES);
   if (minutes !== 0 && minutes < MIN_INTERVAL_MINUTES) throw new Error(`抓取间隔不能少于 ${MIN_INTERVAL_MINUTES} 分钟`);
   return minutes;
 }
 
-/** Validates a whole target as it will be saved (create, or the record with an update applied). */
+/** A target as it will be saved (a create, or the record with an update applied). */
 function normalizeTarget(input) {
-  const { url, host } = normalizeUrl(input.url);
-  const mode = oneOf(input.mode || 'auto', MODES, '抓取模式');
-  const xPage = isXHost(host);
-  if (mode === 'x' && !xPage) throw new Error('X 模式只支持 x.com 或 twitter.com 链接');
-  const options = normalizeOptions(input.options);
-  const crawlsX = mode === 'x' || (mode === 'auto' && xPage);
-  if (crawlsX && options.xScope !== 'visible' && !isXStatusUrl(url)) throw new Error('X 主页需要把范围设为「可见帖子」');
-  if (options.transport === 'http' && options.waitFor) throw new Error('等待元素需要浏览器抓取');
-  const contentType = text(input.contentType, '分类', { max: 64 }) || (crawlsX ? 'social_media' : 'webpage');
   return {
-    url,
-    host,
-    mode,
-    options,
-    contentType,
-    name: text(input.name, '名称', { max: 120 }),
+    ...normalizeRequest(input),
+    name: text(input.name, '名称', 120),
     intervalMinutes: normalizeInterval(input.intervalMinutes),
     enabled: input.enabled === true,
   };
@@ -123,8 +198,8 @@ function firstRunAt(intervalMinutes, now) {
 }
 
 /**
- * The next slot strictly after `now` on the target's own grid. Slots missed while the scheduler was
- * away are skipped, not replayed: a crawl shows the page as it is now, so one catch-up run is enough.
+ * The next slot strictly after `now` on the target's own grid. Slots missed while the scheduler
+ * was away are skipped, not replayed: a crawl shows the page as it is now.
  */
 function nextSlot(dueMs, intervalMinutes, now) {
   const step = intervalMinutes * MINUTE;
@@ -132,76 +207,117 @@ function nextSlot(dueMs, intervalMinutes, now) {
   return { at: dueMs + elapsed * step, missed: Math.max(0, elapsed - 1) };
 }
 
-/** What a run stores about each target, so later edits never change a queued run. */
-function runItem(target) {
+function clip(value, max) {
+  return typeof value === 'string' ? value.replace(CONTROL, ' ').slice(0, max) : '';
+}
+
+function count(value, max) {
+  const number = Math.trunc(Number(value));
+  return Number.isFinite(number) && number > 0 ? Math.min(number, max) : 0;
+}
+
+function isoDate(value) {
+  const time = typeof value === 'string' && value ? Date.parse(value) : NaN;
+  return Number.isNaN(time) ? '' : new Date(time).toISOString();
+}
+
+function list(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function record(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+function httpUrl(value) {
+  const url = clip(value, MAX_URL);
+  return /^https?:\/\//i.test(url) ? url : '';
+}
+
+/** Copies known fields with their limits, so a crawler cannot write anything else. */
+function normalizeResult(raw) {
+  const value = record(raw);
+  const markdown = typeof value.markdown === 'string' ? value.markdown : '';
+  if (!markdown.trim()) throw new Error('抓取结果没有正文');
+  const url = httpUrl(value.url);
+  if (!url) throw new Error('抓取结果地址无效');
+  const items = list(value.items);
+  if (items.length > MAX_ITEMS || items.some(item => !item || typeof item !== 'object' || Array.isArray(item))) throw new Error('抓取条目无效');
   return {
-    target: target.id,
-    url: target.url,
-    name: target.name,
-    mode: target.mode,
-    contentType: target.contentType,
-    options: target.options || {},
+    identity: clip(value.identity, MAX_IDENTITY).trim(),
+    url,
+    canonicalUrl: httpUrl(value.canonicalUrl),
+    host: clip(value.host, 255),
+    httpStatus: count(value.httpStatus, 599),
+    title: clip(value.title, 512),
+    byline: clip(value.byline, 2000),
+    siteName: clip(value.siteName, 2000),
+    language: clip(value.language, 32),
+    description: clip(value.description, 2000),
+    publishedAt: isoDate(value.publishedAt),
+    leadImage: httpUrl(value.leadImage),
+    markdown,
+    html: typeof value.html === 'string' ? value.html : '',
+    wordCount: count(value.wordCount, 100000000),
+    items,
+    links: list(value.links),
+    images: list(value.images),
+    structuredData: list(value.structuredData),
+    extras: record(value.extras),
+    extractor: clip(value.extractor, 64),
+    profile: clip(value.profile, 64),
+    qualityScore: count(value.qualityScore, 100),
+    warnings: list(value.warnings).filter(item => typeof item === 'string').map(item => item.slice(0, 64)).slice(0, 32),
+    trace: record(value.trace),
+    crawlerVersion: clip(value.crawlerVersion, 32),
   };
 }
 
-/** One target's outcome as reported by the crawler. */
-function normalizeReport(raw, targetIds) {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('抓取结果无效');
-  if (!targetIds.includes(raw.target)) throw new Error('抓取结果不属于这个批次');
-  const recordIds = raw.recordIds === undefined ? [] : raw.recordIds;
-  if (!Array.isArray(recordIds) || recordIds.length > MAX_RECORD_IDS || recordIds.some(id => !RECORD_ID.test(String(id)))) {
-    throw new Error('入库记录无效');
-  }
-  const errorCode = typeof raw.errorCode === 'string' ? raw.errorCode : '';
-  if (errorCode && !ERROR_CODE.test(errorCode)) throw new Error('错误代码无效');
-  return {
-    target: raw.target,
-    status: oneOf(raw.status, ['succeeded', 'failed'], '抓取状态'),
-    itemCount: number(raw.itemCount ?? 0, '内容数量', { min: 0, max: MAX_ITEMS_PER_TARGET, integer: true }),
-    recordIds: [...new Set(recordIds)],
-    title: typeof raw.title === 'string' ? raw.title.replace(CONTROL, ' ').trim().slice(0, 512) : '',
-    error: typeof raw.error === 'string' ? raw.error.trim().slice(0, 2000) : '',
-    errorCode,
-    transport: oneOf(raw.transport || '', ['', 'http', 'browser'], '抓取方式'),
-  };
+/**
+ * The identity a document is stored under: the profile's own (`x:status:…`) when it names one,
+ * otherwise the canonical or final URL without its fragment.
+ */
+function documentIdentity(result) {
+  if (result.identity) return result.identity;
+  return (result.canonicalUrl || result.url).replace(/#.*$/, '');
 }
 
-/** Counters the lists show, derived from the per-target results. */
-function summarize(results) {
-  const outcomes = Object.values(results || {});
-  return {
-    reportedCount: outcomes.filter(outcome => outcome.status === 'succeeded' || outcome.status === 'failed').length,
-    succeededCount: outcomes.filter(outcome => outcome.status === 'succeeded').length,
-    itemCount: outcomes.reduce((sum, outcome) => sum + (outcome.itemCount || 0), 0),
-  };
+function isPartial(result) {
+  return result.qualityScore < ACCEPTABLE_SCORE || result.warnings.includes('truncated');
 }
 
-function finalStatus({ targetCount, succeededCount, canceled }) {
-  if (canceled) return 'canceled';
-  if (targetCount > 0 && succeededCount === targetCount) return 'succeeded';
-  return succeededCount > 0 ? 'partial' : 'failed';
+/** A reported failure, with the server's own view of whether it retries. */
+function normalizeFailure(raw) {
+  const value = record(raw);
+  const code = typeof value.code === 'string' && Object.prototype.hasOwnProperty.call(ERROR_CODES, value.code) ? value.code : 'INTERNAL';
+  const message = clip(value.message, 2000).trim() || '抓取失败';
+  return { code, message, retryable: ERROR_CODES[code] };
 }
 
-/** Why a target has no result when its workflow run ended, by the run's conclusion. */
-function unreportedError(conclusion) {
-  if (conclusion === 'timed_out') return '抓取超时，未返回这个页面的结果';
-  if (conclusion === 'success') return '抓取程序没有返回这个页面的结果';
-  return '抓取任务异常结束，可在 GitHub 运行记录中查看原因';
+function retryDelayMs(attempts) {
+  return RETRY_BASE_MS * 2 ** Math.max(0, attempts - 1);
 }
 
 module.exports = {
-  MAX_TARGETS_PER_RUN,
-  MIN_INTERVAL_MINUTES,
+  ACCEPTABLE_SCORE,
+  ERROR_CODES,
+  MAX_ATTEMPTS,
   MAX_INTERVAL_MINUTES,
-  isXStatusUrl,
-  normalizeUrl,
-  normalizeOptions,
-  normalizeTarget,
+  MIN_INTERVAL_MINUTES,
+  OPTION_KEYS,
+  RUNNERS,
+  defaultCategory,
+  documentIdentity,
   firstRunAt,
+  isLocalHost,
+  isPartial,
+  isXStatusUrl,
   nextSlot,
-  runItem,
-  normalizeReport,
-  summarize,
-  finalStatus,
-  unreportedError,
+  normalizeFailure,
+  normalizeOptions,
+  normalizeRequest,
+  normalizeResult,
+  normalizeTarget,
+  normalizeUrl,
+  retryDelayMs,
 };

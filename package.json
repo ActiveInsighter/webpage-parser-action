@@ -1,0 +1,41 @@
+{
+  "name": "anyworkflow-crawler",
+  "version": "0.2.0",
+  "private": true,
+  "description": "AnyWorkflow web crawler: one parser, two executors — a GitHub Actions workflow for public pages and a browser extension for signed-in ones.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.22"
+  },
+  "scripts": {
+    "build": "npm run typecheck && npm run check:layers && node scripts/build.mjs",
+    "build:action": "node scripts/build.mjs --only=action",
+    "build:extension": "node scripts/build.mjs --only=extension",
+    "dev": "node scripts/build.mjs --watch --only=extension",
+    "typecheck": "tsc --noEmit",
+    "check:layers": "node scripts/check-layers.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "node tests/e2e/run.mjs",
+    "test:cloud": "node tests/cloud/run.mjs",
+    "preflight": "npm test && npm run build",
+    "test:live": "node tests/e2e/live.mjs",
+    "crawl": "node dist/action/crawler.mjs crawl",
+    "sync:pocketbase": "node scripts/sync-pocketbase.mjs"
+  },
+  "dependencies": {
+    "@mozilla/readability": "0.6.0",
+    "defuddle": "0.19.6",
+    "zod": "4.6.7",
+    "playwright": "1.64.1"
+  },
+  "devDependencies": {
+    "@types/chrome": "0.3.7",
+    "@types/jsdom": "30.0.0",
+    "@types/node": "26.6.6",
+    "esbuild": "0.28.2",
+    "jsdom": "31.0.0",
+    "typescript": "7.0.2",
+    "vitest": "5.1.0"
+  }
+}
